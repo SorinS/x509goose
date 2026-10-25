@@ -12,7 +12,9 @@ CertificateVerify signatures.
 | `x509.verify` | `verify_chain`, `verify_chain_with` |
 | `x509.constraints` | name constraints |
 | `x509.policy` | certificate policy processing |
-| `x509.crl` | `Crl`, `parse_crl`, `check_crl`, `crl_lookup`, `revocation_status` | It builds on
+| `x509.crl` | `Crl`, `parse_crl`, `check_crl`, `crl_lookup`, `revocation_status` |
+| `x509.keys` | `PrivateKey`, key generation, PKCS #8 / SEC 1 / PKCS #1 / SPKI parsing and marshalling, signing |
+| `x509.create` | `Template`, `create_certificate`, `name_der`, SAN and name-constraint builders, `create_csr`, `parse_csr`, `check_csr`, `create_crl` | It builds on
 [asn1](../asn1goose.git) for DER and [bignum](../bigmongoose.git) for the
 cryptography.
 
@@ -135,6 +137,63 @@ builds. If they fail, it keeps searching for another path.
   CRLs partitioned by reason parse but are never used. `crl_urls(c)`
   lists a certificate's distribution points. OCSP is not implemented.
 
+## Keys
+
+`PrivateKey` holds an RSA key, an EC scalar (P-256, P-384, P-521) or an
+Ed25519 seed. These correspond to Go's functions:
+
+| Go | Here |
+|---|---|
+| `ParsePKCS8PrivateKey`, `ParseECPrivateKey`, `ParsePKCS1PrivateKey` | `parse_private_key(der)` (any of the three) and `parse_private_key_pem` |
+| `MarshalPKCS8PrivateKey`, `MarshalECPrivateKey`, `MarshalPKCS1PrivateKey` | `marshal_pkcs8`, `marshal_sec1`, `marshal_pkcs1` |
+| `MarshalPKIXPublicKey` | `marshal_public_key` |
+| `rsa.GenerateKey`, `ecdsa.GenerateKey`, `ed25519.GenerateKey` | `generate_key(kind, rsa_bits = 2048)` |
+
+The output matches openssl's byte for byte. `sign(key, alg, hash, msg)`
+signs in X.509's forms (ECDSA as DER), `sig_alg_id(alg, hash)` gives the
+AlgorithmIdentifier, and `default_sig(kind)` gives the default algorithm.
+As in Go, the default for RSA is PKCS #1 v1.5 with SHA-256, and for ECDSA
+it is the curve's own hash.
+
+## Creating certificates, requests and CRLs
+
+```goose
+import x509.keys;
+import x509.create;
+
+let key = x509::generate_key(x509::KEY_EC_P256);
+var t, ok = x509::template("CN=www.example.com,O=Example", now, now + 90 * 86400);
+t.key_usage = x509::KU_DIGITAL_SIGNATURE;
+t.ext_key_usage = x509::EKU_SERVER_AUTH;
+x509::add_dns(t.san, "www.example.com");
+let der, err = x509::create_certificate(t, x509::marshal_public_key(key), ca_der, ca_key);
+```
+
+- **Fields.** A `Template` holds:
+  - serial (random when empty), validity, and the subject as Name DER;
+  - basic constraints with path length, and key usage and extended key
+    usage masks;
+  - SAN, permitted and excluded subtrees, policies, CRL URLs;
+  - the signature algorithm (the issuer key's default if left 0), and
+    raw `extra` extensions.
+- **Names.** `name_der` builds a Name from RFC 4514 text, and the
+  `add_dns` / `add_email` / `add_uri` / `add_ip` / `add_dirname` builders
+  fill SANs and subtrees.
+- **Extensions written.** Every certificate gets a subject key identifier
+  (SHA-1 of the key, as Go and openssl compute it), and an authority key
+  identifier from the issuer.
+- **Checks before signing.** The issuer must be a CA allowed to sign
+  certificates, and `issuer_key` must match the issuer certificate (or
+  the subject's key, for a self-signed one). The result is parsed back
+  before it is returned.
+- **Requests.** `create_csr(subject, san, key)` makes a PKCS #10 request
+  with an extensionRequest for the SAN. `parse_csr` reads one,
+  `check_csr` checks its self-signature, and `csr_dns_names` lists its
+  names.
+- **CRLs.** `create_crl(issuer, key, entries, this_update, next_update,
+  number)` makes a v2 CRL, with a reason code per entry, an authority key
+  identifier and a CRL number.
+
 ## Tests
 
 ```bash
@@ -155,6 +214,19 @@ python3 scripts/gen_vectors.py          # regenerate the vectors with openssl
   entries and number must parse as `openssl crl` prints them. RFC 8448's
   server CertificateVerify must verify under the trace's certificate, and
   fail under other schemes or when changed.
+- `keys_create`: openssl's keys must round-trip through every DER form.
+  A PKI made here is then checked: a root, a constrained intermediate,
+  leaves on Ed25519, P-256 and P-521 signed with RSA PKCS #1 v1.5 and
+  RSA-PSS, a certificate issued from a CSR, and CRLs. Fields must read
+  back, paths must validate (or fail on a name constraint or a
+  revocation), and misuse must be refused.
+- `scripts/check_created.py` hands such a PKI to openssl (24 checks):
+  - each leaf verifies strictly for the host and under an explicit
+    policy, and is refused under another policy or host;
+  - the name constraints are enforced;
+  - the CSR and both CRLs verify;
+  - `-crl_check_all` finds the listed leaf revoked and the others good;
+  - every private key matches its certificate.
 - `constraints_api`: subtree matching at its edges (label boundaries,
   leading dots, case, URI hosts with userinfo and ports, IP families).
 - `roots`: the 128 certificates of the system root store must all parse,

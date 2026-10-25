@@ -401,6 +401,26 @@ def main():
             lines.append(f"rfc8448 {cert.hex()} {cv[4:6].hex()} {content.hex()} {cv[8:].hex()}")
 
     vec = os.path.join(ROOT, "test", "vectors")
+    # Keys in each DER form, made by openssl.
+    keys = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for kind, args in [("rsa", ["-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048"]),
+                           ("p256", ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256"]),
+                           ("p384", ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-384"]),
+                           ("p521", ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-521"]),
+                           ("ed25519", ["-algorithm", "ED25519"])]:
+            kp = os.path.join(tmp, kind + ".pem")
+            ossl("genpkey", *args, "-out", kp)
+            pkcs8 = ossl("pkey", "-in", kp, "-outform", "DER").stdout
+            spki = ossl("pkey", "-in", kp, "-pubout", "-outform", "DER").stdout
+            native = "-"
+            if kind == "rsa":
+                native = ossl("rsa", "-in", kp, "-outform", "DER", "-traditional").stdout.hex()
+            elif kind.startswith("p"):
+                native = ossl("ec", "-in", kp, "-outform", "DER").stdout.hex()
+            keys.append(f"key {kind} {pkcs8.hex()} {native} {spki.hex()}")
+    with open(os.path.join(vec, "keys.txt"), "w") as f:
+        f.write("\n".join(keys) + "\n")
     with open(os.path.join(vec, "certs.txt"), "w") as f:
         f.write("\n".join(lines + cases) + "\n")
 
