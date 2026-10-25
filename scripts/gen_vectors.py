@@ -68,6 +68,7 @@ class PKI:
         args = {"rsa": ["-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048"],
                 "p256": ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256"],
                 "p384": ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-384"],
+                "p521": ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-521"],
                 "ed25519": ["-algorithm", "ED25519"]}[kind]
         ossl("genpkey", *args, "-out", self.path(f"{name}.key"))
 
@@ -173,6 +174,8 @@ def main():
         k.cert("leaf_ed", "ed25519", "/CN=example.com", "root_ed", LEAF)
         k.cert("leaf_p384", "p384", "/CN=example.com", "root_p384", LEAF, digest="sha512")
         k.cert("leaf_rsa384", "rsa", "/CN=example.com", "root_rsa", LEAF, digest="sha384")
+        k.cert("int_p521", "p521", "/O=Goose Test/CN=Goose Issuing P-521", "root_p384", CA, digest="sha384")
+        k.cert("leaf_p521", "p256", "/CN=example.com", "int_p521", LEAF, digest="sha512")
         k.cert("leaf_expired", "p256", "/CN=example.com", "int_ec", LEAF, digest="sha384",
                start=NOW - 400 * DAY, end=NOW - 30 * DAY)
         k.cert("leaf_future", "p256", "/CN=example.com", "int_ec", LEAF, digest="sha384",
@@ -289,6 +292,7 @@ def main():
         case("ed25519", "leaf_ed", [], ["root_ed"], "example.com", "ok")
         case("p384_sha512", "leaf_p384", [], ["root_p384"], "example.com", "ok")
         case("rsa_sha384", "leaf_rsa384", [], ["root_rsa"], "example.com", "ok")
+        case("p521_issuer", "leaf_p521", ["int_p521"], ["root_p384"], "example.com", "ok")
         case("extra_intermediates", "leaf_ec", ["int_noca", "int_pss", "int_ec"], ["root_ed", "root_rsa"],
              "example.com", "ok")
         case("wrong_root_key", "leaf_ec", ["int_ec"], ["root_rsa_other"], "example.com", "bad_signature")

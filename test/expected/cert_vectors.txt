@@ -1,1 +1,1 @@
-cert vectors: 46 certificates, 452 checks, 0 failed
+cert vectors: 48 certificates, 469 checks, 0 failed

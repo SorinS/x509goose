@@ -72,6 +72,7 @@ let KEY_RSA: i64 = 1;
 let KEY_EC_P256: i64 = 2;
 let KEY_EC_P384: i64 = 3;
 let KEY_ED25519: i64 = 4;
+let KEY_EC_P521: i64 = 5;
 
 // Key usage bits (RFC 5280 §4.2.1.3), as KU_* masks of Cert.key_usage.
 let KU_DIGITAL_SIGNATURE: u32 = 1;
@@ -224,6 +225,7 @@ fn spki_of(der: const u8[:], t: asn1::Tlv) -> i64, asn1::Tlv, bool {
     } else if asn1::oid_is(der, alg[0], "1.2.840.10045.2.1") && alg.len == 2 {
         if asn1::oid_is(der, alg[1], "1.2.840.10045.3.1.7") { kind = KEY_EC_P256; }
         if asn1::oid_is(der, alg[1], "1.3.132.0.34") { kind = KEY_EC_P384; }
+        if asn1::oid_is(der, alg[1], "1.3.132.0.35") { kind = KEY_EC_P521; }
     } else if asn1::oid_is(der, alg[0], "1.3.101.112") && alg.len == 1 {
         kind = KEY_ED25519;
     }
@@ -750,8 +752,11 @@ fn verify_with(key_cert: const Cert&, alg: i64, h: i64, salt: i64, msg: const u8
         return if good { OK } else { ERR_BAD_SIGNATURE };
     }
     if alg == SIG_ECDSA {
-        if key_cert.key_type != KEY_EC_P256 && key_cert.key_type != KEY_EC_P384 { return ERR_BAD_SIGNATURE; }
-        let curve = if key_cert.key_type == KEY_EC_P256 { bignum::p256() } else { bignum::p384() };
+        if key_cert.key_type != KEY_EC_P256 && key_cert.key_type != KEY_EC_P384 && key_cert.key_type != KEY_EC_P521 {
+            return ERR_BAD_SIGNATURE;
+        }
+        let curve = if key_cert.key_type == KEY_EC_P256 { bignum::p256() }
+                    else if key_cert.key_type == KEY_EC_P384 { bignum::p384() } else { bignum::p521() };
         let raw, okd = bignum::ecdsa_sig_from_der(curve, sig);
         if !okd { return ERR_BAD_SIGNATURE; }
         let good = bignum::ecdsa_verify_digest(curve, kb, bignum::hash_bits(h, msg), raw);
@@ -779,6 +784,7 @@ let RSA_PKCS1_SHA384: u16 = 0x0501;
 let RSA_PKCS1_SHA512: u16 = 0x0601;
 let ECDSA_SECP256R1_SHA256: u16 = 0x0403;
 let ECDSA_SECP384R1_SHA384: u16 = 0x0503;
+let ECDSA_SECP521R1_SHA512: u16 = 0x0603;
 let RSA_PSS_RSAE_SHA256: u16 = 0x0804;
 let RSA_PSS_RSAE_SHA384: u16 = 0x0805;
 let RSA_PSS_RSAE_SHA512: u16 = 0x0806;
@@ -800,6 +806,10 @@ fn verify_scheme(c: const Cert&, scheme: u16, msg: const u8[:], sig: const u8[:]
     if scheme == ECDSA_SECP384R1_SHA384 {
         if c.key_type != KEY_EC_P384 { return ERR_BAD_SIGNATURE; }
         return verify_with(c, SIG_ECDSA, 384, 0, msg, sig);
+    }
+    if scheme == ECDSA_SECP521R1_SHA512 {
+        if c.key_type != KEY_EC_P521 { return ERR_BAD_SIGNATURE; }
+        return verify_with(c, SIG_ECDSA, 512, 0, msg, sig);
     }
     if scheme == ED25519 { return verify_with(c, SIG_ED25519, 0, 0, msg, sig); }
     return ERR_UNSUPPORTED_ALGORITHM;

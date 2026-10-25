@@ -59,7 +59,7 @@ scalar or an `asn1::Tlv` into that copy:
 | Signatures | Keys |
 |---|---|
 | RSA PKCS #1 v1.5 with SHA-256, SHA-384, SHA-512 | RSA (up to 4096 bits) |
-| RSASSA-PSS with SHA-256, SHA-384, SHA-512 (MGF1 on the same hash) | ECDSA P-256, P-384 |
+| RSASSA-PSS with SHA-256, SHA-384, SHA-512 (MGF1 on the same hash) | ECDSA P-256, P-384, P-521 |
 | ECDSA with SHA-256, SHA-384, SHA-512 | Ed25519 |
 | Ed25519 | |
 
@@ -81,8 +81,8 @@ covers exactly one label, and needs at least two labels after it.
 `check_signature(c, issuer)` checks that issuer's key signed c.
 `verify_scheme(c, scheme, msg, sig)` checks a TLS 1.3 SignatureScheme
 signature with c's key: rsa_pkcs1_*, rsa_pss_rsae_*,
-ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384 (with the curve bound to
-the scheme, as TLS 1.3 requires), and ed25519.
+ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, ecdsa_secp521r1_sha512
+(with the curve bound to the scheme, as TLS 1.3 requires), and ed25519.
 
 `verify_chain(leaf, intermediates, roots, now, host)` searches depth-first
 for a path from the leaf through the intermediates to a root, and
