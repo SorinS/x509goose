@@ -6,6 +6,7 @@ import std;
 import x509 from "..";
 import asn1 from "../../asn1goose.git";
 import bignum from "../../bigmongoose.git";
+import x509.verify;
 
 var failures = 0;
 var checks = 0;

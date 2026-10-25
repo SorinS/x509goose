@@ -2,8 +2,17 @@
 
 X.509 certificates (RFC 5280) for the Goose language. It covers parsing,
 names, subject alternative names, signature checks, host name matching
-(RFC 6125), certification path validation for TLS servers, and checking
-TLS 1.3 CertificateVerify signatures. It builds on
+(RFC 6125), certification path validation for TLS servers with name
+constraints, certificate policies and CRLs, and checking TLS 1.3
+CertificateVerify signatures.
+
+| Module | Holds |
+|---|---|
+| `x509` | `Cert`, parsing, names, SANs, host matching, signatures, `Options` |
+| `x509.verify` | `verify_chain`, `verify_chain_with` |
+| `x509.constraints` | name constraints |
+| `x509.policy` | certificate policy processing |
+| `x509.crl` | `Crl`, `parse_crl`, `check_crl`, `crl_lookup`, `revocation_status` | It builds on
 [asn1](../asn1goose.git) for DER and [bignum](../bigmongoose.git) for the
 cryptography.
 
@@ -11,6 +20,7 @@ cryptography.
 import x509 from "../x509goose.git";
 import asn1 from "../asn1goose.git";        // x509 needs both; the root declares them
 import bignum from "../bigmongoose.git";
+import x509.verify;
 
 let err = x509::verify_chain(leaf_der, intermediates_der, roots_der, now, "example.com");
 if err != x509::OK { print("certificate refused: ", x509::error_text(err)); }
@@ -88,9 +98,42 @@ serverAuth, and its key usage must allow a TLS key. `host`, if not empty,
 must match the leaf. A leaf that is itself one of the roots is accepted
 as pinned.
 
-Name constraints, certificate policies and revocation (CRLs, OCSP) are
-not implemented. A certificate with one of those extensions marked
-critical is refused rather than accepted unchecked.
+`verify_chain_with(leaf, intermediates, roots, crls, now, host, opts)`
+adds three checks on top of `verify_chain`, run on each complete path it
+builds. If they fail, it keeps searching for another path.
+
+- **Name constraints** (RFC 5280 §4.2.1.10). Every CA's permitted and
+  excluded subtrees, the root's included, bind every certificate below it
+  except self-issued intermediates.
+  - Supported forms: dNSName, rfc822Name (mailbox, host or `.domain`), URI
+    hosts, iPAddress with mask, and directoryName. A directoryName is
+    compared RDN by RDN, values case-folded, so a PrintableString and a
+    UTF8String spelling of the same name match.
+  - What is checked: the SAN entries and the subject, including any
+    emailAddress in it.
+  - Other forms (otherName and the rest) can't be evaluated, so a
+    certificate is refused only if it has names of a form that is
+    constrained.
+- **Certificate policies** (§6.1). The policy tree is built from
+  certificatePolicies, policyMappings, policyConstraints and
+  inhibitAnyPolicy, and capped at 1,000 nodes. It is then intersected with
+  `opts.policies`: dotted OIDs separated by spaces, empty for anyPolicy.
+  `opts.require_explicit_policy`, `inhibit_policy_mapping` and
+  `inhibit_any_policy` are the initial inputs. A CA's
+  requireExplicitPolicy applies whatever the options say.
+- **Revocation.** `opts.crl_check` takes `CRL_NONE`, `CRL_LEAF` or
+  `CRL_ALL` (every certificate below the root). A CRL counts for a
+  certificate only when all of these hold:
+  - it names the certificate's issuer and is signed by that issuer's key;
+  - the issuer's key usage, if present, allows cRLSign;
+  - it is current at `now`;
+  - its issuingDistributionPoint scope (user or CA certificates only)
+    includes the certificate.
+
+  A certificate listed in such a CRL is `ERR_REVOKED`. A certificate with
+  no usable CRL is `ERR_REVOCATION_UNKNOWN`. Delta CRLs, indirect CRLs and
+  CRLs partitioned by reason parse but are never used. `crl_urls(c)`
+  lists a certificate's distribution points. OCSP is not implemented.
 
 ## Tests
 
@@ -104,8 +147,16 @@ python3 scripts/gen_vectors.py          # regenerate the vectors with openssl
   certificate's subject, issuer, serial, dates, SANs and constraints must
   parse as openssl prints them. Each of 29 path cases must give its
   expected result, and `openssl verify` agreed on pass or fail when the
-  vectors were made. RFC 8448's server CertificateVerify must verify under
-  the trace's certificate, and fail under other schemes or when changed.
+  vectors were made. 32 more cases cover name constraints (each form, and
+  excluded subtrees), policies (explicit, mapped, inhibited, required by
+  a CA) and CRLs (revoked, missing, expired, wrong signer, an intermediate
+  revoked). For those, openssl ran with `-policy_check`, the matching
+  `-crl_check` flags and the same acceptable policies. Each CRL's dates,
+  entries and number must parse as `openssl crl` prints them. RFC 8448's
+  server CertificateVerify must verify under the trace's certificate, and
+  fail under other schemes or when changed.
+- `constraints_api`: subtree matching at its edges (label boundaries,
+  leading dots, case, URI hosts with userinfo and ports, IP families).
 - `roots`: the 128 certificates of the system root store must all parse,
   and every subject must read exactly as openssl prints it. Every
   self-signature in a supported algorithm must verify (87 of them); the

@@ -32,6 +32,10 @@ let ERR_EXTENDED_KEY_USAGE: i64 = 10;
 let ERR_HOSTNAME: i64 = 11;
 let ERR_UNKNOWN_CRITICAL_EXTENSION: i64 = 12;
 let ERR_CHAIN_TOO_LONG: i64 = 13;
+let ERR_NAME_CONSTRAINTS: i64 = 14;
+let ERR_POLICY: i64 = 15;
+let ERR_REVOKED: i64 = 16;
+let ERR_REVOCATION_UNKNOWN: i64 = 17;
 
 fn error_text(e: i64) -> const u8[:] {
     if e == OK { return "ok"; }
@@ -48,6 +52,10 @@ fn error_text(e: i64) -> const u8[:] {
     if e == ERR_HOSTNAME { return "host name does not match"; }
     if e == ERR_UNKNOWN_CRITICAL_EXTENSION { return "unknown critical extension"; }
     if e == ERR_CHAIN_TOO_LONG { return "chain too long"; }
+    if e == ERR_NAME_CONSTRAINTS { return "name not allowed by a name constraint"; }
+    if e == ERR_POLICY { return "no acceptable certificate policy"; }
+    if e == ERR_REVOKED { return "revoked"; }
+    if e == ERR_REVOCATION_UNKNOWN { return "revocation status unknown"; }
     return "unknown error";
 }
 
@@ -100,6 +108,12 @@ struct Cert {
     has_ext_key_usage: bool, ext_key_usage: u32,
     has_san: bool, san: asn1::Tlv,   // GeneralNames
     ski: asn1::Tlv, aki: asn1::Tlv,  // key identifiers (OCTET STRING content), or start == end
+    has_name_constraints: bool, name_constraints: asn1::Tlv,   // NameConstraints
+    has_policies: bool, policies: asn1::Tlv,                   // certificatePolicies
+    has_policy_mappings: bool, policy_mappings: asn1::Tlv,     // PolicyMappings
+    require_explicit_policy: i64, inhibit_policy_mapping: i64, // policyConstraints, -1: absent
+    inhibit_any_policy: i64,                                   // -1: absent
+    has_crl_dp: bool, crl_dp: asn1::Tlv,                       // CRLDistributionPoints
     unknown_critical: bool,
     der: u8[>..],
 }
@@ -113,7 +127,11 @@ fn empty_cert() -> Cert {
         spki: no_tlv(), key_type: KEY_UNKNOWN, key: no_tlv(),
         has_basic_constraints: false, is_ca: false, path_len: -1,
         has_key_usage: false, key_usage: 0, has_ext_key_usage: false, ext_key_usage: 0,
-        has_san: false, san: no_tlv(), ski: no_tlv(), aki: no_tlv(), unknown_critical: false,
+        has_san: false, san: no_tlv(), ski: no_tlv(), aki: no_tlv(),
+        has_name_constraints: false, name_constraints: no_tlv(), has_policies: false, policies: no_tlv(),
+        has_policy_mappings: false, policy_mappings: no_tlv(), require_explicit_policy: -1,
+        inhibit_policy_mapping: -1, inhibit_any_policy: -1, has_crl_dp: false, crl_dp: no_tlv(),
+        unknown_critical: false,
         der: [],
     }
 }
@@ -218,6 +236,90 @@ fn key_bytes(der: const u8[:], t: asn1::Tlv) -> u8[>..], bool {
     return b, ok && unused == 0;
 }
 
+let ANY_POLICY: const u8[:] = "2.5.29.32.0";
+
+// GeneralSubtrees: each a SEQUENCE of a GeneralName and no minimum or
+// maximum (RFC 5280 says they must be absent for the name forms in use).
+fn subtrees_ok(der: const u8[:], t: asn1::Tlv) -> bool {
+    let subs, ok = asn1::children(der, t);
+    if !ok || subs.len == 0 { return false; }
+    for s in subs {
+        let p, okp = asn1::children_of(der, s, asn1::SEQUENCE);
+        if !okp || p.len != 1 || p[0].cls != asn1::CLASS_CONTEXT { return false; }
+    }
+    return true;
+}
+
+// NameConstraints ::= SEQUENCE { permittedSubtrees [0], excludedSubtrees [1] },
+// at least one of them.
+fn name_constraints_ok(der: const u8[:], t: asn1::Tlv) -> bool {
+    let p, ok = asn1::children_of(der, t, asn1::SEQUENCE);
+    if !ok || p.len == 0 || p.len > 2 { return false; }
+    var last: i64 = -1;
+    for x in p {
+        if x.cls != asn1::CLASS_CONTEXT || !x.constructed || x.number > 1 || x.number <= last { return false; }
+        last = x.number;
+        if !subtrees_ok(der, x) { return false; }
+    }
+    return true;
+}
+
+// certificatePolicies: PolicyInformation ::= SEQUENCE { policyIdentifier, qualifiers OPTIONAL },
+// each policy once.
+fn policies_ok(der: const u8[:], t: asn1::Tlv) -> bool {
+    let ps, ok = asn1::children_of(der, t, asn1::SEQUENCE);
+    if !ok || ps.len == 0 { return false; }
+    for i in ps.len {
+        let pi, okp = asn1::children_of(der, ps[i], asn1::SEQUENCE);
+        if !okp || pi.len < 1 || pi.len > 2 || pi[0].tag != asn1::OID { return false; }
+        if pi.len == 2 && pi[1].tag != asn1::SEQUENCE { return false; }
+        for j in i {
+            let pj, okj = asn1::children(der, ps[j]);
+            if der[pj[0].off..pj[0].end] == der[pi[0].off..pi[0].end] { return false; }
+        }
+    }
+    return true;
+}
+
+// PolicyMappings: pairs of issuer and subject policies, neither anyPolicy.
+fn mappings_ok(der: const u8[:], t: asn1::Tlv) -> bool {
+    let ms, ok = asn1::children_of(der, t, asn1::SEQUENCE);
+    if !ok || ms.len == 0 { return false; }
+    for m in ms {
+        let pair, okp = asn1::children_of(der, m, asn1::SEQUENCE);
+        if !okp || pair.len != 2 || pair[0].tag != asn1::OID || pair[1].tag != asn1::OID { return false; }
+        if asn1::oid_is(der, pair[0], ANY_POLICY) || asn1::oid_is(der, pair[1], ANY_POLICY) { return false; }
+    }
+    return true;
+}
+
+// The URIs of a certificate's CRL distribution points (fullName entries).
+fn crl_urls(c: const Cert&) -> u8[][>..] {
+    var out: u8[][>..] = [];
+    if !c.has_crl_dp { return out; }
+    let d = c.der[..];
+    let dps, ok = asn1::children(d, c.crl_dp);
+    for dp in dps {
+        let fs, okf = asn1::children(d, dp);
+        for f in fs {
+            if f.tag != asn1::ctx(0, true) { continue; }         // distributionPoint
+            let names, okn = asn1::children(d, f);
+            for n in names {
+                if n.tag != asn1::ctx(0, true) { continue; }     // fullName
+                let gns, okg = asn1::children(d, n);
+                for g in gns {
+                    if g.tag == asn1::ctx(6, false) {
+                        var u: u8[>..] = [];
+                        u.append(d[g.off..g.end]);
+                        out.push(copy(u));
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}
+
 fn parse_extensions(c: Cert&, der: const u8[:], t: asn1::Tlv) -> bool {
     let wrap, okw = asn1::explicit(der, t);
     let exts, ok = asn1::children_of(der, wrap, asn1::SEQUENCE);
@@ -292,9 +394,45 @@ fn parse_extensions(c: Cert&, der: const u8[:], t: asn1::Tlv) -> bool {
             let a, oka = asn1::children_of(der, inner, asn1::SEQUENCE);
             if !oki || inner.end != val.end || !oka { return false; }
             for x in a { if x.tag == asn1::ctx(0, false) { c.aki = x; } }
+        } else if asn1::oid_is(der, f[0], "2.5.29.30") {
+            if !oki || inner.end != val.end || !name_constraints_ok(der, inner) { return false; }
+            c.has_name_constraints = true;
+            c.name_constraints = inner;
+        } else if asn1::oid_is(der, f[0], "2.5.29.32") {
+            if !oki || inner.end != val.end || !policies_ok(der, inner) { return false; }
+            c.has_policies = true;
+            c.policies = inner;
+        } else if asn1::oid_is(der, f[0], "2.5.29.33") {
+            if !oki || inner.end != val.end || !mappings_ok(der, inner) { return false; }
+            c.has_policy_mappings = true;
+            c.policy_mappings = inner;
+        } else if asn1::oid_is(der, f[0], "2.5.29.36") {
+            // PolicyConstraints ::= SEQUENCE { requireExplicitPolicy [0] SkipCerts OPTIONAL,
+            //                                  inhibitPolicyMapping [1] SkipCerts OPTIONAL }
+            let pc, okc = asn1::children_of(der, inner, asn1::SEQUENCE);
+            if !oki || inner.end != val.end || !okc || pc.len == 0 || pc.len > 2 { return false; }
+            var last: i64 = -1;
+            for x in pc {
+                let v, okv = asn1::read_i64(der, x, x.tag);
+                if x.cls != asn1::CLASS_CONTEXT || x.constructed || x.number > 1 || x.number <= last
+                    || !okv || v < 0 {
+                    return false;
+                }
+                last = x.number;
+                if x.number == 0 { c.require_explicit_policy = v; } else { c.inhibit_policy_mapping = v; }
+            }
+        } else if asn1::oid_is(der, f[0], "2.5.29.54") {
+            let v, okv = asn1::read_i64(der, inner);
+            if !oki || inner.end != val.end || !okv || v < 0 { return false; }
+            c.inhibit_any_policy = v;
+        } else if asn1::oid_is(der, f[0], "2.5.29.31") {
+            let dps, okd = asn1::children_of(der, inner, asn1::SEQUENCE);
+            if !oki || inner.end != val.end || !okd || dps.len == 0 { return false; }
+            c.has_crl_dp = true;
+            c.crl_dp = inner;
         } else if critical {
-            // Name constraints, policies and the rest are not implemented,
-            // so a critical one makes the certificate unusable here.
+            // Anything else critical is not implemented, so it makes the
+            // certificate unusable here.
             c.unknown_critical = true;
         }
     }
@@ -667,130 +805,24 @@ fn verify_scheme(c: const Cert&, scheme: u16, msg: const u8[:], sig: const u8[:]
     return ERR_UNSUPPORTED_ALGORITHM;
 }
 
-// --- Path validation --------------------------------------------------------
+// --- Validation options -----------------------------------------------------
 
-// Checks that apply to any certificate on a path: dates and extensions.
-fn check_common(c: const Cert&, now: i64) -> i64 {
-    if c.unknown_critical { return ERR_UNKNOWN_CRITICAL_EXTENSION; }
-    if now < c.not_before { return ERR_NOT_YET_VALID; }
-    if now > c.not_after { return ERR_EXPIRED; }
-    return OK;
+// Which certificates must have a usable CRL: none, the leaf, or every one
+// below the root.
+let CRL_NONE: i64 = 0;
+let CRL_LEAF: i64 = 1;
+let CRL_ALL: i64 = 2;
+
+// The inputs of path validation beyond the certificates and the time: CRL
+// checking, and RFC 5280's policy inputs, with the acceptable policies as
+// dotted OIDs separated by spaces (empty for any policy).
+struct Options {
+    crl_check: i64,
+    require_explicit_policy: bool, inhibit_policy_mapping: bool, inhibit_any_policy: bool,
+    policies: u8[>..],
 }
 
-// Checks on a certificate that issues the one below it, `below` CA
-// certificates (not counting the leaf) further down the path.
-fn check_issuer(c: const Cert&, now: i64, below: i64) -> i64 {
-    let e = check_common(c, now);
-    if e != OK { return e; }
-    if !c.has_basic_constraints || !c.is_ca { return ERR_NOT_CA; }
-    if c.path_len >= 0 && below > c.path_len { return ERR_PATH_LENGTH; }
-    if c.has_key_usage && c.key_usage & KU_KEY_CERT_SIGN == 0 { return ERR_KEY_USAGE; }
-    // A CA restricted by extended key usage must allow server
-    // authentication (as Go, Chrome and Firefox require).
-    if c.has_ext_key_usage && c.ext_key_usage & (EKU_SERVER_AUTH | EKU_ANY) == 0 { return ERR_EXTENDED_KEY_USAGE; }
-    return OK;
-}
-
-// The certificate at `off` in a concatenation, and the offset after it.
-fn cert_at(list: const u8[:], off: i64) -> Cert, i64 {
-    let t, ok = asn1::read(list, off, list.len);
-    if !ok { return empty_cert(), -1; }
-    let c, e = parse(list[t.start..t.end]);
-    if e != OK { return c, -1; }
-    return c, t.end;
-}
-
-let MAX_DEPTH: i64 = 8;
-
-// Validates a TLS server certificate: a path from `leaf` through any of
-// `intermediates` to one of `roots` (each DER certificates concatenated),
-// every link signed by the next, all of them valid at `now` (seconds since
-// 1970), the CAs allowed to issue, and the leaf allowed for server
-// authentication and valid for `host` (no check when host is empty). The
-// roots' own signatures and dates are not checked, only their keys and
-// their constraints, as trust anchors are. Returns OK or the error of the
-// path that came closest.
-fn verify_chain(leaf_der: const u8[:], intermediates: const u8[:], roots: const u8[:], now: i64,
-                host: const u8[:]) -> i64 {
-    let leaf, e = parse(leaf_der);
-    if e != OK { return e; }
-    let le = check_common(leaf, now);
-    if le != OK { return le; }
-    if leaf.has_ext_key_usage && leaf.ext_key_usage & (EKU_SERVER_AUTH | EKU_ANY) == 0 { return ERR_EXTENDED_KEY_USAGE; }
-    if leaf.has_key_usage && leaf.key_usage & (KU_DIGITAL_SIGNATURE | KU_KEY_ENCIPHERMENT | KU_KEY_AGREEMENT) == 0 {
-        return ERR_KEY_USAGE;
-    }
-    if host.len > 0 && !matches_host(leaf, host) { return ERR_HOSTNAME; }
-    // The leaf itself trusted, as a pinned certificate.
-    var r = 0;
-    while r < roots.len {
-        let t, okr = asn1::read(roots, r, roots.len);
-        if !okr { break; }
-        if roots[t.start..t.end] == leaf_der { return OK; }
-        r = t.end;
-    }
-    // Depth-first search. path[i] is the offset in `intermediates` of the
-    // i-th certificate above the leaf; tried[i] is where the search for
-    // the next one up resumes.
-    var path: i64[>..<] = [];
-    var tried: i64[>..<] = [0];
-    var best = ERR_UNKNOWN_ISSUER;
-    loop {
-        let depth = path.len;
-        // The certificate at the top of the path so far.
-        var top = empty_cert();
-        if depth == 0 {
-            top = copy(leaf);
-        } else {
-            let c, n = cert_at(intermediates, path[depth - 1]);
-            top = copy(c);
-        }
-        // A root that issued it ends the search.
-        var ro = 0;
-        while ro < roots.len {
-            let root, next = cert_at(roots, ro);
-            if next < 0 { break; }
-            ro = next;
-            if !issued_by(top, root) { continue; }
-            let ce = check_issuer(root, now, depth);
-            // A trust anchor's dates and constraints are often relaxed;
-            // here they hold like any CA's, except that a root without
-            // basicConstraints is accepted if it is self-issued (v1 roots).
-            let ok_root = ce == OK || (ce == ERR_NOT_CA && !root.has_basic_constraints && self_issued(root));
-            if !ok_root { best = ce; continue; }
-            let se = check_signature(top, root);
-            if se == OK { return OK; }
-            best = se;
-        }
-        // Otherwise an intermediate that issued it, not already on the path.
-        var found = false;
-        if depth < MAX_DEPTH {
-            var io = tried[depth];
-            while io < intermediates.len {
-                let cand, next = cert_at(intermediates, io);
-                if next < 0 { return ERR_MALFORMED; }
-                let here = io;
-                io = next;
-                var on_path = false;
-                for p in path { if p == here { on_path = true; } }
-                if on_path || !issued_by(top, cand) { continue; }
-                let ce = check_issuer(cand, now, depth);
-                if ce != OK { best = ce; continue; }
-                let se = check_signature(top, cand);
-                if se != OK { best = se; continue; }
-                tried[depth] = io;
-                path.push(here);
-                tried.push(0);
-                found = true;
-                break;
-            }
-        } else {
-            best = ERR_CHAIN_TOO_LONG;
-        }
-        if found { continue; }
-        // A dead end: back up one level.
-        if path.len == 0 { return best; }
-        let dropped = path.pop();
-        let t = tried.pop();
-    }
+fn options() -> Options {
+    Options { crl_check: CRL_NONE, require_explicit_policy: false, inhibit_policy_mapping: false,
+              inhibit_any_policy: false, policies: [] }
 }

@@ -39,7 +39,10 @@ DAY = 86400
 
 ERR = {"ok": 0, "malformed": 1, "unsupported": 2, "bad_signature": 3, "expired": 4,
        "not_yet_valid": 5, "unknown_issuer": 6, "not_ca": 7, "path_length": 8,
-       "key_usage": 9, "eku": 10, "hostname": 11, "critical": 12}
+       "key_usage": 9, "eku": 10, "hostname": 11, "critical": 12, "name_constraints": 14,
+       "policy": 15, "revoked": 16, "revocation_unknown": 17}
+POL = "1.3.6.1.4.1.55555."
+ANY = "2.5.29.32.0"
 
 
 def ossl(*args, input=None, check=True):
@@ -73,7 +76,7 @@ class PKI:
         """Makes name.pem, signed by issuer (itself when None)."""
         self.key(name, kind)
         with open(self.path(f"{name}.ext"), "w") as f:
-            f.write(ext.replace(";", "\n") + "\n")
+            f.write((ext if "\n" in ext else ext.replace(";", "\n")) + "\n")
         ossl("req", "-new", "-key", self.path(f"{name}.key"), "-subj", subject,
              "-out", self.path(f"{name}.csr"))
         signer = issuer or name
@@ -91,6 +94,27 @@ class PKI:
         self.der[name] = ossl("x509", "-in", self.path(f"{name}.pem"), "-outform", "DER").stdout
         self.kind = getattr(self, "kind", {})
         self.kind[name] = kind
+
+    def crl(self, name, issuer, revoked=(), start=NOW - DAY, end=NOW + 30 * DAY, md="sha256"):
+        """name.pem: a CRL from issuer listing the named certificates."""
+        db = self.path(f"{name}.idx")
+        with open(db, "w") as f:
+            for r, reason in revoked:
+                serial = format(0x1000 + list(self.der).index(r), "X")
+                if len(serial) % 2:
+                    serial = "0" + serial
+                f.write(f"R\t{time.strftime('%y%m%d%H%M%SZ', time.gmtime(NOW + 3650 * DAY))}\t"
+                        f"{time.strftime('%y%m%d%H%M%SZ', time.gmtime(NOW - 2 * DAY))},{reason}\t{serial}\tunknown\t/CN=x\n")
+        with open(self.path(f"{name}.num"), "w") as f:
+            f.write("01\n")
+        with open(self.path(f"{name}.cnf"), "w") as f:
+            f.write(f"[ca]\ndefault_ca = d\n[d]\ndatabase = {db}\ncrlnumber = {self.path(name + '.num')}\n"
+                    f"default_md = {md}\n")
+        ossl("ca", "-gencrl", "-config", self.path(f"{name}.cnf"), "-keyfile", self.path(f"{issuer}.key"),
+             "-cert", self.path(f"{issuer}.pem"), "-crl_lastupdate", gtime(start), "-crl_nextupdate", gtime(end),
+             "-out", self.path(f"{name}.pem"))
+        self.crls = getattr(self, "crls", {})
+        self.crls[name] = ossl("crl", "-in", self.path(f"{name}.pem"), "-outform", "DER").stdout
 
     def is_ed(self, name):
         return getattr(self, "kind", {}).get(name) == "ed25519"
@@ -171,10 +195,69 @@ def main():
             f.write(ossl("x509", "-inform", "DER", input=bytes(bad)).stdout)
         k.cert("root_rsa_other", "rsa", "/C=US/O=Goose Test/CN=Goose Root R1", ext=CA)
 
+        # Name constraints.
+        k.cert("int_nc", "p256", "/O=Goose Test/CN=Constrained CA", "root_rsa",
+               "basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n"
+               "nameConstraints=critical,permitted;DNS:example.com,permitted;IP:192.0.2.0/255.255.255.0,"
+               "permitted;email:.example.com,permitted;dirName:dir_sect,excluded;DNS:bad.example.com\n"
+               "[dir_sect]\nO=Goose Test\n")
+        def nc_leaf(name, subject, san):
+            k.cert(name, "p256", subject, "int_nc",
+                   "basicConstraints=critical,CA:FALSE;keyUsage=critical,digitalSignature;"
+                   f"extendedKeyUsage=serverAuth;subjectAltName={san}")
+        nc_leaf("leaf_nc_ok", "/O=Goose Test/CN=www.example.com", "DNS:www.example.com,IP:192.0.2.7,email:a@mail.example.com")
+        nc_leaf("leaf_nc_dns", "/O=Goose Test/CN=www.example.org", "DNS:www.example.org")
+        nc_leaf("leaf_nc_excluded", "/O=Goose Test/CN=x.bad.example.com", "DNS:x.bad.example.com")
+        nc_leaf("leaf_nc_ip", "/O=Goose Test/CN=www.example.com", "DNS:www.example.com,IP:198.51.100.1")
+        nc_leaf("leaf_nc_dn", "/O=Other/CN=www.example.com", "DNS:www.example.com")
+        nc_leaf("leaf_nc_email", "/O=Goose Test/CN=www.example.com", "DNS:www.example.com,email:a@example.org")
+
+        # Policies.
+        def pol_leaf(name, issuer, policies=None):
+            ext = LEAF.replace("DNS:example.com,DNS:*.example.com,", "DNS:example.com,")
+            if policies:
+                ext += ";certificatePolicies=" + ",".join(policies)
+            k.cert(name, "p256", "/CN=example.com", issuer, ext)
+        k.cert("int_pol", "p256", "/O=Goose Test/CN=Policy CA", "root_rsa",
+               CA + f";certificatePolicies={POL}1,{POL}2")
+        pol_leaf("leaf_pol1", "int_pol", [POL + "1"])
+        pol_leaf("leaf_nopol", "int_pol")
+        k.cert("int_req", "p256", "/O=Goose Test/CN=Explicit Policy CA", "root_rsa",
+               CA + f";certificatePolicies={ANY};policyConstraints=requireExplicitPolicy:0")
+        pol_leaf("leaf_req_none", "int_req")
+        pol_leaf("leaf_req_pol", "int_req", [POL + "1"])
+        k.cert("int_map", "p256", "/O=Goose Test/CN=Mapping CA", "root_rsa",
+               CA + f";certificatePolicies={POL}1;policyMappings={POL}1:{POL}7")
+        pol_leaf("leaf_map", "int_map", [POL + "7"])
+        k.cert("int_anyinh", "p256", "/O=Goose Test/CN=Inhibit Any CA", "root_rsa",
+               CA + f";certificatePolicies={ANY};inhibitAnyPolicy=0")
+        pol_leaf("leaf_any_inh", "int_anyinh", [ANY])
+        k.cert("int_any", "p256", "/O=Goose Test/CN=Any Policy CA", "root_rsa",
+               CA + f";certificatePolicies={ANY}")
+        pol_leaf("leaf_any", "int_any", [ANY])
+
+        # Revocation.
+        k.cert("leaf_revoked", "p256", "/CN=example.com", "int_ec", LEAF, digest="sha384")
+        k.cert("int_ec_fake", "p384", "/O=Goose Test/CN=Goose Issuing E1", "root_rsa", CA, digest="sha384")
+        k.crl("crl_int", "int_ec", [("leaf_revoked", "keyCompromise")], md="sha384")
+        k.crl("crl_int_expired", "int_ec", [], start=NOW - 60 * DAY, end=NOW - 30 * DAY, md="sha384")
+        k.crl("crl_int_fake", "int_ec_fake", [], md="sha384")
+        k.crl("crl_root", "root_rsa", [])
+        k.crl("crl_root_revokes_int", "root_rsa", [("int_ec", "cACompromise")])
+
         for name in k.der:
             if name != "leaf_badsig":
                 lines += fields(k, name)
         lines.append(f"cert leaf_badsig {k.der['leaf_badsig'].hex()}")
+        for name, der in k.crls.items():
+            lines.append(f"crl {name} {der.hex()}")
+            t = ossl("crl", "-in", k.path(f"{name}.pem"), "-noout", "-text").stdout.decode()
+            def ts(label):
+                m = re.search(label + r": (\w+ +\d+ [\d:]+ \d+) GMT", t)
+                return calendar.timegm(time.strptime(m.group(1), "%b %d %H:%M:%S %Y"))
+            n = len(re.findall(r"Serial Number:", t))
+            num = int(re.search(r"X509v3 CRL Number: *\n *(\w+)", t).group(1), 16)
+            lines.append(f"crlinfo {name} {ts('Last Update')} {ts('Next Update')} {n} {num}")
 
         def case(label, leaf, inters, roots, host, want, now=NOW):
             # openssl's verdict, which must agree on pass or fail.
@@ -228,6 +311,72 @@ def main():
         case("issuer_client_eku", "leaf_via_client", ["int_client"], ["root_rsa"], "example.com", "eku")
         case("path_length", "leaf_deep", ["int_sub", "int_ec"], ["root_rsa"], "example.com", "path_length")
         case("unknown_critical", "leaf_critical", ["int_ec"], ["root_rsa"], "example.com", "critical")
+        def case2(label, leaf, inters, roots, crls, opts, host, want):
+            with open(k.path("ca.pem"), "w") as f:
+                for r in roots:
+                    f.write(open(k.path(f"{r}.pem")).read())
+            with open(k.path("un.pem"), "w") as f:
+                for i in inters:
+                    f.write(open(k.path(f"{i}.pem")).read())
+            with open(k.path("crls.pem"), "w") as f:
+                for c in crls:
+                    f.write(open(k.path(f"{c}.pem")).read())
+            args = ["verify", "-attime", str(NOW), "-purpose", "sslserver", "-CAfile", k.path("ca.pem"),
+                    "-x509_strict", "-policy_check"]
+            if inters:
+                args += ["-untrusted", k.path("un.pem")]
+            if crls:
+                args += ["-CRLfile", k.path("crls.pem")]
+            for o in opts:
+                if o == "crl_leaf": args.append("-crl_check")
+                elif o == "crl_all": args.append("-crl_check_all")
+                elif o == "explicit": args.append("-explicit_policy")
+                elif o == "inhibit_map": args.append("-inhibit_map")
+                elif o == "inhibit_any": args.append("-inhibit_any")
+                elif o.startswith("policy="): args += ["-policy", o[7:]]
+            # openssl verify's acceptable set is empty unless given;
+            # RFC 5280's default, which the package uses, is anyPolicy.
+            if not any(o.startswith("policy=") for o in opts):
+                args += ["-policy", ANY]
+            if host != "-":
+                args += ["-verify_ip" if re.fullmatch(r"[0-9.]+", host) else "-verify_hostname", host]
+            p = ossl(*args, k.path(f"{leaf}.pem"), check=False)
+            assert (p.returncode == 0) == (want == "ok"), (label, p.stdout, p.stderr)
+            cases.append(f"case2 {label} {leaf} {','.join(inters) or '-'} {','.join(roots)} "
+                         f"{','.join(crls) or '-'} {','.join(opts) or '-'} {NOW} {host} {ERR[want]}")
+
+        case2("nc_ok", "leaf_nc_ok", ["int_nc"], ["root_rsa"], [], [], "www.example.com", "ok")
+        case2("nc_ip_ok", "leaf_nc_ok", ["int_nc"], ["root_rsa"], [], [], "192.0.2.7", "ok")
+        case2("nc_dns", "leaf_nc_dns", ["int_nc"], ["root_rsa"], [], [], "www.example.org", "name_constraints")
+        case2("nc_excluded", "leaf_nc_excluded", ["int_nc"], ["root_rsa"], [], [], "x.bad.example.com", "name_constraints")
+        case2("nc_ip", "leaf_nc_ip", ["int_nc"], ["root_rsa"], [], [], "www.example.com", "name_constraints")
+        case2("nc_dn", "leaf_nc_dn", ["int_nc"], ["root_rsa"], [], [], "www.example.com", "name_constraints")
+        case2("nc_email", "leaf_nc_email", ["int_nc"], ["root_rsa"], [], [], "www.example.com", "name_constraints")
+        case2("pol_default", "leaf_pol1", ["int_pol"], ["root_rsa"], [], [], "example.com", "ok")
+        case2("pol_explicit_any", "leaf_pol1", ["int_pol"], ["root_rsa"], [], ["explicit"], "example.com", "ok")
+        case2("pol_explicit_match", "leaf_pol1", ["int_pol"], ["root_rsa"], [], ["explicit", f"policy={POL}1"], "example.com", "ok")
+        case2("pol_explicit_other", "leaf_pol1", ["int_pol"], ["root_rsa"], [], ["explicit", f"policy={POL}2"], "example.com", "policy")
+        case2("pol_other_not_required", "leaf_pol1", ["int_pol"], ["root_rsa"], [], [f"policy={POL}2"], "example.com", "ok")
+        case2("pol_leaf_none", "leaf_nopol", ["int_pol"], ["root_rsa"], [], [], "example.com", "ok")
+        case2("pol_leaf_none_explicit", "leaf_nopol", ["int_pol"], ["root_rsa"], [], ["explicit"], "example.com", "policy")
+        case2("pol_required_by_ca", "leaf_req_none", ["int_req"], ["root_rsa"], [], [], "example.com", "policy")
+        case2("pol_required_met", "leaf_req_pol", ["int_req"], ["root_rsa"], [], [], "example.com", "ok")
+        case2("pol_mapped", "leaf_map", ["int_map"], ["root_rsa"], [], ["explicit", f"policy={POL}1"], "example.com", "ok")
+        case2("pol_mapped_subject_side", "leaf_map", ["int_map"], ["root_rsa"], [], ["explicit", f"policy={POL}7"], "example.com", "policy")
+        case2("pol_mapping_inhibited", "leaf_map", ["int_map"], ["root_rsa"], [], ["explicit", f"policy={POL}1", "inhibit_map"], "example.com", "policy")
+        case2("pol_any", "leaf_any", ["int_any"], ["root_rsa"], [], ["explicit"], "example.com", "ok")
+        case2("pol_any_inhibited_option", "leaf_any", ["int_any"], ["root_rsa"], [], ["explicit", "inhibit_any"], "example.com", "policy")
+        case2("pol_any_inhibited_by_ca", "leaf_any_inh", ["int_anyinh"], ["root_rsa"], [], ["explicit"], "example.com", "policy")
+        case2("crl_good", "leaf_ec", ["int_ec"], ["root_rsa"], ["crl_int"], ["crl_leaf"], "example.com", "ok")
+        case2("crl_revoked", "leaf_revoked", ["int_ec"], ["root_rsa"], ["crl_int"], ["crl_leaf"], "example.com", "revoked")
+        case2("crl_revoked_unchecked", "leaf_revoked", ["int_ec"], ["root_rsa"], ["crl_int"], [], "example.com", "ok")
+        case2("crl_missing", "leaf_ec", ["int_ec"], ["root_rsa"], [], ["crl_leaf"], "example.com", "revocation_unknown")
+        case2("crl_expired", "leaf_ec", ["int_ec"], ["root_rsa"], ["crl_int_expired"], ["crl_leaf"], "example.com", "revocation_unknown")
+        case2("crl_wrong_signer", "leaf_ec", ["int_ec"], ["root_rsa"], ["crl_int_fake"], ["crl_leaf"], "example.com", "revocation_unknown")
+        case2("crl_all_good", "leaf_ec", ["int_ec"], ["root_rsa"], ["crl_int", "crl_root"], ["crl_all"], "example.com", "ok")
+        case2("crl_all_missing_root", "leaf_ec", ["int_ec"], ["root_rsa"], ["crl_int"], ["crl_all"], "example.com", "revocation_unknown")
+        case2("crl_all_int_revoked", "leaf_ec", ["int_ec"], ["root_rsa"], ["crl_int", "crl_root_revokes_int"], ["crl_all"], "example.com", "revoked")
+        case2("crl_leaf_ignores_int", "leaf_ec", ["int_ec"], ["root_rsa"], ["crl_int", "crl_root_revokes_int"], ["crl_leaf"], "example.com", "ok")
         case("root_as_leaf", "root_rsa", [], ["root_rsa"], "-", "key_usage")   # keyCertSign only
 
         # The RFC 8448 server certificate and its CertificateVerify, from

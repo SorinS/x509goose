@@ -9,6 +9,8 @@ import std;
 import x509 from "..";
 import asn1 from "../../asn1goose.git";
 import bignum from "../../bigmongoose.git";
+import x509.verify;
+import x509.crl;
 
 var failures = 0;
 var checks = 0;
@@ -44,12 +46,47 @@ fn cert_der(name: const u8[:]) -> u8[>..] {
     return none;
 }
 
-// The DER of the named certificates, concatenated.
+fn crl_der(name: const u8[:]) -> u8[>..] {
+    for line in split(vectors(), '\n') {
+        let w = words(line);
+        if w.len == 3 && w[0] == "crl" && w[1] == name { return unhex(w[2]); }
+    }
+    print("no CRL ", name);
+    assert(false);
+    var none: u8[>..] = [];
+    return none;
+}
+
+// The DER of the named certificates (or CRLs), concatenated.
 fn bundle(names: const u8[:]) -> u8[>..] {
     var out: u8[>..] = [];
     if names == "-" { return out; }
     for n in split(names, ',') { out.append(cert_der(n)); }
     return out;
+}
+
+fn crl_bundle(names: const u8[:]) -> u8[>..] {
+    var out: u8[>..] = [];
+    if names == "-" { return out; }
+    for n in split(names, ',') { out.append(crl_der(n)); }
+    return out;
+}
+
+fn options_of(text: const u8[:]) -> x509::Options {
+    var o = x509::options();
+    if text == "-" { return o; }
+    for opt in split(text, ',') {
+        if opt == "crl_leaf" { o.crl_check = x509::CRL_LEAF; }
+        else if opt == "crl_all" { o.crl_check = x509::CRL_ALL; }
+        else if opt == "explicit" { o.require_explicit_policy = true; }
+        else if opt == "inhibit_map" { o.inhibit_policy_mapping = true; }
+        else if opt == "inhibit_any" { o.inhibit_any_policy = true; }
+        else if opt.len > 7 && opt[..7] == "policy=" {
+            if o.policies.len > 0 { o.policies.push(' '); }
+            o.policies.append(opt[7..]);
+        }
+    }
+    return o;
 }
 
 // The rest of a line after its first two words, as written.
@@ -114,6 +151,31 @@ fn main() {
             let got = x509::verify_chain(leaf, inters, roots, now, host);
             check(line, got == want);
             if got != want { print("    got ", got, " (", x509::error_text(got), ")"); }
+        } else if w[0] == "case2" {
+            let leaf = cert_der(w[2]);
+            let inters = bundle(w[3]);
+            let roots = bundle(w[4]);
+            let crls = crl_bundle(w[5]);
+            let opts = options_of(w[6]);
+            let now, okn = parse_int(w[7], 10);
+            let want, okw = parse_int(w[9], 10);
+            let host = if w[8] == "-" { "" } else { w[8] };
+            let got = x509::verify_chain_with(leaf, inters, roots, crls, now, host, opts);
+            check(line, got == want);
+            if got != want { print("    got ", got, " (", x509::error_text(got), ")"); }
+        } else if w[0] == "crlinfo" {
+            let crl, e = x509::parse_crl(crl_der(w[1]));
+            let tu, ok1 = parse_int(w[2], 10);
+            let nu, ok2 = parse_int(w[3], 10);
+            let count, ok3 = parse_int(w[4], 10);
+            let num, ok4 = parse_int(w[5], 10);
+            var n = 0;
+            if crl.has_revoked {
+                let es, oke = asn1::children(crl.der, crl.revoked);
+                n = es.len;
+            }
+            check(line, e == x509::OK && crl.version == 2 && crl.this_update == tu && crl.next_update == nu
+                  && n == count && crl.crl_number == num && !crl.unsupported);
         } else if w[0] == "rfc8448" {
             let cert, e = x509::parse(unhex(w[1]));
             check("rfc8448 cert", e == x509::OK && cert.key_type == x509::KEY_RSA);
@@ -141,6 +203,31 @@ fn main() {
     let ca, e4 = x509::parse(cert_der("int_ec"));
     check("ca ku", ca.key_usage == (x509::KU_KEY_CERT_SIGN | x509::KU_CRL_SIGN) && ca.path_len == 0);
     check("issued by", x509::issued_by(ec, ca) && !x509::issued_by(ca, ec));
+    // CRL details: the revoked entry, its reason, and the issuer's checks.
+    let crl, ce = x509::parse_crl(crl_der("crl_int"));
+    let revoked_leaf, er = x509::parse(cert_der("leaf_revoked"));
+    let int_ec, ei = x509::parse(cert_der("int_ec"));
+    let listed, reason = x509::crl_lookup(crl, revoked_leaf);
+    check("crl lookup", listed && reason == x509::REASON_KEY_COMPROMISE);
+    let not_listed, r2 = x509::crl_lookup(crl, ec);
+    check("crl not listed", !not_listed);
+    check("crl check", x509::check_crl(crl, int_ec, 1793000000) == x509::OK);
+    check("crl covers", x509::crl_covers(crl, revoked_leaf) && !x509::crl_covers(crl, int_ec));
+    let root, eroot = x509::parse(cert_der("root_rsa"));
+    check("crl wrong issuer", x509::check_crl(crl, root, 1793000000) == x509::ERR_UNKNOWN_ISSUER);
+    check("crl too late", x509::check_crl(crl, int_ec, 1793000000 + 40 * 86400) == x509::ERR_EXPIRED);
+    var bad_crl = crl_der("crl_int");
+    bad_crl[bad_crl.len - 2] ^= 1;
+    let bc, ebc = x509::parse_crl(bad_crl);
+    check("crl bad signature", ebc == x509::OK && x509::check_crl(bc, int_ec, 1793000000) == x509::ERR_BAD_SIGNATURE);
+    let nc, enc = x509::parse(cert_der("int_nc"));
+    check("nc parsed", enc == x509::OK && nc.has_name_constraints);
+    let req, ereq = x509::parse(cert_der("int_req"));
+    check("policy constraints parsed", req.require_explicit_policy == 0 && req.inhibit_policy_mapping == -1 && req.has_policies);
+    let inh, einh = x509::parse(cert_der("int_anyinh"));
+    check("inhibit any parsed", inh.inhibit_any_policy == 0);
+    let mp, emp = x509::parse(cert_der("int_map"));
+    check("mappings parsed", mp.has_policy_mappings);
     // Truncated and altered DER does not parse.
     let der = cert_der("leaf_ec");
     let t1, et1 = x509::parse(der[..der.len - 1]);
