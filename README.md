@@ -14,6 +14,8 @@ CertificateVerify signatures.
 | `x509.policy` | certificate policy processing |
 | `x509.crl` | `Crl`, `parse_crl`, `check_crl`, `crl_lookup`, `revocation_status` |
 | `x509.keys` | `PrivateKey`, key generation, PKCS #8 / SEC 1 / PKCS #1 / SPKI parsing and marshalling, signing |
+| `x509.ocsp` | OCSP (RFC 6960): `ocsp_create_request`, `ocsp_parse_request`, `ocsp_parse_response`, `ocsp_check_response`, `ocsp_create_response`, `ocsp_error_response` |
+| `x509.pkcs12` | `pkcs12_decode`: PKCS #12 files to their key and certificates |
 | `x509.create` | `Template`, `create_certificate`, `name_der`, SAN and name-constraint builders, `create_csr`, `parse_csr`, `check_csr`, `create_crl` | It builds on
 [asn1](../asn1goose.git) for DER and [bignum](../bigmongoose.git) for the
 cryptography.
@@ -194,6 +196,32 @@ let der, err = x509::create_certificate(t, x509::marshal_public_key(key), ca_der
   number)` makes a v2 CRL, with a reason code per entry, an authority key
   identifier and a CRL number.
 
+## OCSP
+
+`ocsp_create_request(cert, issuer, hash = 160)` makes the request Go's
+`ocsp.CreateRequest` makes (one CertID, SHA-1 by default, or SHA-256, -384,
+-512), and `ocsp_parse_request` reads its first CertID back.
+`ocsp_parse_response(der, serial = "")` reads a response's structure and
+its answer for that serial (or its only answer), without checking it;
+`ocsp_check_response(r, cert, issuer, now = 0)` then requires a
+successful response whose CertID names the certificate and its issuer,
+signed by the issuer or by a responder certificate the issuer signed with
+id-kp-OCSPSigning, and current, and gives OK (good), ERR_REVOKED, or
+ERR_REVOCATION_UNKNOWN. The CertID and EKU checks are RFC 6960's and go
+beyond Go's. `ocsp_create_response(issuer, responder, key, template,
+produced_at, include_cert)` makes what Go's `ocsp.CreateResponse` makes,
+byte for byte; `ocsp_error_response(status)` the unsuccessful ones.
+
+## PKCS #12
+
+`pkcs12_decode(pfx, password) -> key, certs, err` gives the private key
+(PKCS #8 DER, for `parse_private_key`) and the certificates (DER
+concatenated) of a .p12 or .pfx file, after checking its MAC (HMAC over
+SHA-1, SHA-224 or SHA-2). It reads what Go's x/crypto/pkcs12 reads
+(pbeWithSHAAnd3-KeyTripleDES-CBC, pbeWithSHAAnd40BitRC2-CBC) and what it
+refuses: openssl 3's default PBES2 (PBKDF2 and AES-CBC), 2-key 3DES,
+128-bit RC2, unencrypted bags. A wrong password is ERR_BAD_SIGNATURE.
+
 ## Tests
 
 ```bash
@@ -221,6 +249,17 @@ python3 scripts/gen_vectors.py          # regenerate the vectors with openssl
   issued from a CSR, and CRLs. Fields must read
   back, paths must validate (or fail on a name constraint or a
   revocation), and misuse must be refused.
+- `ocsp_vectors`: requests and responses made by Go's x/crypto/ocsp
+  (`scripts/govectors`): requests made here byte for byte and parsed back;
+  good, revoked and unknown responses from the CA and from a delegated
+  responder, parsed and checked (and refused for a responder without
+  id-kp-OCSPSigning, another CA, the wrong certificate, too early or too
+  late), then made here byte for byte; the error responses.
+- `pkcs12_vectors`: 54 files from openssl (`scripts/pkcs12_vectors.py`):
+  RSA and P-256 keys with their chains under nine schemes and three
+  passwords, each decoding to openssl's key and certificates; wrong
+  passwords and changed bytes refused. Go's x/crypto/pkcs12 reads the 12
+  legacy ones to the same keys (and refuses the rest).
 - `scripts/check_created.py` hands such a PKI to openssl (30 checks):
   - each leaf verifies strictly for the host and under an explicit
     policy, and is refused under another policy or host;
