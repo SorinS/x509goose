@@ -13,7 +13,7 @@ CertificateVerify signatures.
 | `x509.constraints` | name constraints |
 | `x509.policy` | certificate policy processing |
 | `x509.crl` | `Crl`, `parse_crl`, `check_crl`, `crl_lookup`, `revocation_status` |
-| `x509.keys` | `PrivateKey`, key generation, PKCS #8 / SEC 1 / PKCS #1 / SPKI parsing and marshalling, signing |
+| `x509.keys` | `PrivateKey`, key generation, PKCS #8 / SEC 1 / PKCS #1 / SPKI parsing and marshalling (ML-DSA and DSA included), signing |
 | `x509.ocsp` | OCSP (RFC 6960): `ocsp_create_request`, `ocsp_parse_request`, `ocsp_parse_response`, `ocsp_check_response`, `ocsp_create_response`, `ocsp_error_response` |
 | `x509.pkcs12` | `pkcs12_decode`: PKCS #12 files to their key and certificates |
 | `x509.create` | `Template`, `create_certificate`, `name_der`, SAN and name-constraint builders, `create_csr`, `parse_csr`, `check_csr`, `create_crl` | It builds on
@@ -65,7 +65,13 @@ scalar or an `asn1::Tlv` into that copy:
 | RSA PKCS #1 v1.5 with SHA-256, SHA-384, SHA-512 | RSA (up to 4096 bits) |
 | RSASSA-PSS with SHA-256, SHA-384, SHA-512 (MGF1 on the same hash) | ECDSA P-224, P-256, P-384, P-521 |
 | ECDSA with SHA-256, SHA-384, SHA-512 | Ed25519 |
-| Ed25519 | |
+| Ed25519 | ML-DSA-44, ML-DSA-65, ML-DSA-87 |
+| ML-DSA-44, ML-DSA-65, ML-DSA-87 (pure, empty context, RFC 9881) | DSA (p up to 3072 bits; parameters in the key) |
+| DSA with SHA-224, SHA-256, SHA-384, SHA-512 | |
+
+An ML-DSA signature must come from a key of the same parameter set
+(`sig_hash` holds the set: 44, 65 or 87). Go 1.27 parses DSA keys but
+checks no DSA signatures; here they are checked, as openssl does.
 
 SHA-1 and other algorithms parse but fail when used, with
 `ERR_UNSUPPORTED_ALGORITHM`.
@@ -137,25 +143,37 @@ builds. If they fail, it keeps searching for another path.
   A certificate listed in such a CRL is `ERR_REVOKED`. A certificate with
   no usable CRL is `ERR_REVOCATION_UNKNOWN`. Delta CRLs, indirect CRLs and
   CRLs partitioned by reason parse but are never used. `crl_urls(c)`
-  lists a certificate's distribution points. OCSP is not implemented.
+  lists a certificate's distribution points. OCSP is in `x509.ocsp`.
 
 ## Keys
 
-`PrivateKey` holds an RSA key, an EC scalar (P-224, P-256, P-384, P-521) or an
-Ed25519 seed. These correspond to Go's functions:
+`PrivateKey` holds an RSA key, an EC scalar (P-224, P-256, P-384, P-521),
+an Ed25519 or ML-DSA seed (`seed`), or a DSA key (`dsa`). These
+correspond to Go's functions:
 
 | Go | Here |
 |---|---|
 | `ParsePKCS8PrivateKey`, `ParseECPrivateKey`, `ParsePKCS1PrivateKey` | `parse_private_key(der)` (any of the three) and `parse_private_key_pem` |
 | `MarshalPKCS8PrivateKey`, `MarshalECPrivateKey`, `MarshalPKCS1PrivateKey` | `marshal_pkcs8`, `marshal_sec1`, `marshal_pkcs1` |
 | `MarshalPKIXPublicKey` | `marshal_public_key` |
-| `rsa.GenerateKey`, `ecdsa.GenerateKey`, `ed25519.GenerateKey` | `generate_key(kind, rsa_bits = 2048)` |
+| `rsa.GenerateKey`, `ecdsa.GenerateKey`, `ed25519.GenerateKey`, `mldsa.GenerateKey`, `dsa.GenerateParameters` + `GenerateKey` | `generate_key(kind, bits = 2048)` (`bits` is p's size for DSA) |
 
-The output matches openssl's byte for byte. `sign(key, alg, hash, msg)`
+The output matches openssl's byte for byte. ML-DSA private keys follow
+RFC 9881 and Go:
+- they are written as the seed alone (`[0]` IMPLICIT OCTET STRING), as
+  Go and `openssl -provparam ml-dsa.output_formats=seed-only` write them;
+- openssl's default form, the seed with the expanded key, is read when
+  the two agree (Go refuses it);
+- the expanded key without its seed is refused, as Go refuses it.
+
+DSA keys go beyond Go, which has no DSA private keys in x509. Both
+PKCS #8 and openssl's "DSA PRIVATE KEY" are read, and PKCS #8 is
+written. DSA signatures use RFC 6979 nonces; ML-DSA signing is hedged. `sign(key, alg, hash, msg)`
 signs in X.509's forms (ECDSA as DER), `sig_alg_id(alg, hash)` gives the
 AlgorithmIdentifier, and `default_sig(kind)` gives the default algorithm.
-As in Go, the default for RSA is PKCS #1 v1.5 with SHA-256, and for ECDSA
-it is the curve's own hash.
+As in Go, the default for RSA is PKCS #1 v1.5 with SHA-256, for ECDSA
+it is the curve's own hash, and for ML-DSA the key's own set. For DSA it
+is SHA-256, as in openssl.
 
 ## Creating certificates, requests and CRLs
 
@@ -249,6 +267,22 @@ python3 scripts/gen_vectors.py          # regenerate the vectors with openssl
   issued from a CSR, and CRLs. Fields must read
   back, paths must validate (or fail on a name constraint or a
   revocation), and misuse must be refused.
+- `pq_vectors`: ML-DSA and DSA (`scripts/pq_vectors.py`):
+  - openssl's ML-DSA-44/65/87 keys in all three PKCS #8 forms, and DSA
+    keys of each (L, N) in PKCS #8 and the traditional form, must parse,
+    or be refused where they should be;
+  - keys must marshal back to openssl's bytes, and Go's (from fixed
+    seeds) to Go's;
+  - ML-DSA and DSA hierarchies made by openssl and by Go must validate
+    as openssl and Go said: ML-DSA-87 → 65 → 44 leaves, P-256 and DSA
+    leaves under ML-DSA, and DSA signed with SHA-256 and SHA-224;
+  - every key must sign a certificate here that checks, and TLS
+    signatures under its scheme.
+
+  `scripts/check_created.py` also has openssl verify an ML-DSA-65 root's
+  ML-DSA-44, ML-DSA-87 and DSA leaves, a DSA root's leaf, and an ML-DSA
+  CSR and CRL, all made here. Go's crypto/x509 verifies the ML-DSA ones
+  and reads their keys.
 - `ocsp_vectors`: requests and responses made by Go's x/crypto/ocsp
   (`scripts/govectors`): requests made here byte for byte and parsed back;
   good, revoked and unknown responses from the CA and from a delegated

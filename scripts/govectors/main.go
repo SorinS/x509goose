@@ -7,6 +7,10 @@
 // each response.
 //
 //	cd scripts/govectors && GOFLAGS=-mod=mod GOPROXY=off go run . > ../../test/vectors/ocsp.txt
+//
+// With the argument `pq` it prints instead the Go part of pq.txt (see
+// pq.go and scripts/pq_vectors.py); with `check <dir>` it checks what
+// tools/make_pki.goose made (for scripts/check_created.py).
 package main
 
 import (
@@ -21,6 +25,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"os"
 	"time"
 
 	"golang.org/x/crypto/ocsp"
@@ -92,6 +97,14 @@ func unix(t time.Time) int64 {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "pq" {
+		pqMain()
+		return
+	}
+	if len(os.Args) > 2 && os.Args[1] == "check" {
+		checkMain(os.Args[2])
+		return
+	}
 	caKey := rsaKey()
 	ca := cert("ca", "Goose OCSP CA", 1, caKey.Public(), nil, caKey, true, nil)
 	otherKey := rsaKey()

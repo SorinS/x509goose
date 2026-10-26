@@ -1,8 +1,15 @@
 // x509.keys: private and public keys in their DER forms, and signing.
-// Parsing and marshalling PKCS #8 (RSA, EC, Ed25519), SEC 1 (EC),
-// PKCS #1 (RSA) and SubjectPublicKeyInfo, as Go's x509 Parse/Marshal
+// Parsing and marshalling PKCS #8 (RSA, EC, Ed25519, ML-DSA, DSA), SEC 1
+// (EC), PKCS #1 (RSA) and SubjectPublicKeyInfo, as Go's x509 Parse/Marshal
 // functions do; key generation; and signatures in the forms X.509 and
-// TLS carry them (ECDSA as DER), with their AlgorithmIdentifiers.
+// TLS carry them (ECDSA and DSA as DER), with their AlgorithmIdentifiers.
+//
+// ML-DSA private keys are their 32-byte seed (RFC 9881). PKCS #8 carries
+// the seed alone ([0] IMPLICIT OCTET STRING, what Go and this package
+// write) or the seed with the expanded key (openssl's default, read only
+// when the two agree); the expanded key without its seed is refused, as
+// Go refuses it. DSA keys go beyond Go, which has no DSA private keys in
+// x509: PKCS #8 and openssl's "DSA PRIVATE KEY" are read, PKCS #8 written.
 
 namespace x509;
 
@@ -13,15 +20,17 @@ import bignum;
 import bignum.rsa;
 import bignum.ec;
 import bignum.ed25519;
+import bignum.mldsa;
+import bignum.dsa;
 import bignum.hmac;
 import bignum.entropy;
 
 // A private key of one of the KEY_* types: an EC scalar (big-endian, the
-// curve's length), an Ed25519 seed, or an RSA key.
-struct PrivateKey { kind: i64, ec_sk: u8[..66], ed_seed: u8[32], rsa: bignum::RsaPrivateKey }
+// curve's length), an Ed25519 or ML-DSA seed, a DSA key, or an RSA key.
+struct PrivateKey { kind: i64, ec_sk: u8[..66], seed: u8[32], dsa: bignum::DsaKey, rsa: bignum::RsaPrivateKey }
 
 fn empty_key() -> PrivateKey {
-    PrivateKey { kind: KEY_UNKNOWN, ec_sk: [], ed_seed: [0; 32],
+    PrivateKey { kind: KEY_UNKNOWN, ec_sk: [], seed: [0; 32], dsa: bignum::DsaKey { p: [], q: [], g: [], y: [], x: [] },
                  rsa: bignum::RsaPrivateKey { n: [], e: [], d: [], p: [], q: [], dp: [], dq: [], qinv: [] } }
 }
 
@@ -30,15 +39,25 @@ fn curve_oid(kind: i64) -> const u8[:] {
     else if kind == KEY_EC_P224 { "1.3.132.0.33" } else { "1.3.132.0.35" }
 }
 
-// A new key from the OS's entropy; rsa_bits for RSA keys.
-fn generate_key(kind: i64, rsa_bits: i64 = 2048) -> PrivateKey {
+// A new key from the OS's entropy; `bits` is the modulus size of RSA
+// keys and the size of p for DSA keys (with a 256-bit q; 160 bits for p
+// of 1024, which takes nothing larger).
+fn generate_key(kind: i64, bits: i64 = 2048) -> PrivateKey {
     var k = empty_key();
     k.kind = kind;
     if kind == KEY_RSA {
-        k.rsa = bignum::rsa_generate(rsa_bits);
+        k.rsa = bignum::rsa_generate(bits);
+    } else if is_mldsa(kind) {
+        let seed, pk = bignum::mldsa_keygen(mldsa_set(kind));
+        for i in 32 { k.seed[i] = seed[i]; }
+    } else if kind == KEY_DSA {
+        let p, q, g = bignum::dsa_generate_parameters(bits, if bits == 1024 { 160 } else { 256 });
+        let dk, ok = bignum::dsa_generate_key(p, q, g);
+        assert(ok);
+        k.dsa = dk;
     } else if kind == KEY_ED25519 {
         let seed, pk = bignum::ed25519_keypair();
-        for i in 32 { k.ed_seed[i] = seed[i]; }
+        for i in 32 { k.seed[i] = seed[i]; }
     } else {
         assert(is_ec(kind));
         let c = curve_of_key(kind);
@@ -98,8 +117,56 @@ fn parse_ec_private(k: PrivateKey&, d: const u8[:], t: asn1::Tlv, curve: i64) ->
     return true;
 }
 
-// A private key in PKCS #8, SEC 1 or PKCS #1 DER (ParsePKCS8PrivateKey,
-// ParseECPrivateKey and ParsePKCS1PrivateKey in one).
+// ML-DSA-PrivateKey ::= CHOICE { seed [0] IMPLICIT OCTET STRING (SIZE (32)),
+// expandedKey OCTET STRING, both SEQUENCE { seed, expandedKey } }.
+fn parse_mldsa_private(k: PrivateKey&, d: const u8[:], t: asn1::Tlv, set: i64) -> bool {
+    var seed: u8[>..] = [];
+    if t.tag == asn1::ctx(0, false) {
+        seed.append(d[t.off..t.end]);
+    } else if t.tag == asn1::SEQUENCE {
+        let f, ok = asn1::children(d, t);
+        if !ok || f.len != 2 { return false; }
+        let s, ok1 = asn1::read_octets(d, f[0]);
+        let e, ok2 = asn1::read_octets(d, f[1]);
+        if !ok1 || !ok2 || s.len != 32 || e.len != bignum::mldsa_sk_len(set) { return false; }
+        if bignum::mldsa_expand_key(set, s) != e { return false; }
+        seed.append(s);
+    } else {
+        return false;
+    }
+    if seed.len != 32 { return false; }
+    for i in 32 { k.seed[i] = seed[i]; }
+    k.kind = mldsa_kind(set);
+    return true;
+}
+
+// A DSA key from its parameters and x, with y = g^x mod p.
+fn dsa_private(k: PrivateKey&, p: const u8[:], q: const u8[:], g: const u8[:], x: const u8[:], y: const u8[:] = "") -> bool {
+    let pub, okp = bignum::dsa_key_from(p, q, g, g);    // checks p, q and g first
+    if !okp || x.len > q.len { return false; }
+    let gx = bignum::dsa_powmod(g, x, p);
+    if y.len > 0 && bignum::cmp(bignum::from_bytes_be(gx), bignum::from_bytes_be(y)) != 0 { return false; }
+    let dk, ok = bignum::dsa_key_from(p, q, g, gx, x);
+    if !ok { return false; }
+    k.dsa = dk;
+    k.kind = KEY_DSA;
+    return true;
+}
+
+// DSAPrivateKey (openssl's "DSA PRIVATE KEY") ::= SEQUENCE { 0, p, q, g, y, x }.
+fn parse_dsa_legacy(k: PrivateKey&, d: const u8[:], f: const asn1::Tlv[:]) -> bool {
+    let v, okv = asn1::read_i64(d, f[0]);
+    let p, ok1 = asn1::read_uint(d, f[1]);
+    let q, ok2 = asn1::read_uint(d, f[2]);
+    let g, ok3 = asn1::read_uint(d, f[3]);
+    let y, ok4 = asn1::read_uint(d, f[4]);
+    let x, ok5 = asn1::read_uint(d, f[5]);
+    if !okv || v != 0 || !ok1 || !ok2 || !ok3 || !ok4 || !ok5 { return false; }
+    return dsa_private(k, p, q, g, x, y);
+}
+
+// A private key in PKCS #8, SEC 1, PKCS #1 or openssl's DSA DER
+// (ParsePKCS8PrivateKey, ParseECPrivateKey and ParsePKCS1PrivateKey in one).
 fn parse_private_key(d: const u8[:]) -> PrivateKey, bool {
     var k = empty_key();
     let top, ok = asn1::parse(d);
@@ -119,9 +186,23 @@ fn parse_private_key(d: const u8[:]) -> PrivateKey, bool {
         if asn1::oid_is(d, alg[0], "1.3.101.112") {
             let seed, okseed = asn1::read_octets(d, inner);
             if alg.len != 1 || !okseed || seed.len != 32 { return k, false; }
-            for i in 32 { k.ed_seed[i] = seed[i]; }
+            for i in 32 { k.seed[i] = seed[i]; }
             k.kind = KEY_ED25519;
             return k, true;
+        }
+        let set = mldsa_set_of_oid(d, alg[0]);
+        if set != 0 {
+            if alg.len != 1 { return k, false; }
+            let okm = parse_mldsa_private(k, d, inner, set);
+            return k, okm;
+        }
+        if asn1::oid_is(d, alg[0], "1.2.840.10040.4.1") {
+            if alg.len != 2 { return k, false; }
+            let p, q, g, okp = dss_parms(d, alg[1]);
+            let x, okx = asn1::read_uint(d, inner);
+            if !okp || !okx { return k, false; }
+            let okd = dsa_private(k, p, q, g, x);
+            return k, okd;
         }
         if asn1::oid_is(d, alg[0], "1.2.840.10045.2.1") && alg.len == 2 {
             let curve = ec_named_curve(d, alg[1]);
@@ -132,12 +213,13 @@ fn parse_private_key(d: const u8[:]) -> PrivateKey, bool {
         return k, false;
     }
     if f.len == 9 { let okr = parse_rsa_private(k, d, top); return k, okr; }
+    if f.len == 6 { let okd = parse_dsa_legacy(k, d, f); return k, okd; }
     if f[1].tag == asn1::OCTET_STRING { let oke = parse_ec_private(k, d, top, KEY_UNKNOWN); return k, oke; }
     return k, false;
 }
 
-// The first private key in a PEM text ("PRIVATE KEY", "EC PRIVATE KEY" or
-// "RSA PRIVATE KEY").
+// The first private key in a PEM text ("PRIVATE KEY", "EC PRIVATE KEY",
+// "RSA PRIVATE KEY" or "DSA PRIVATE KEY").
 fn parse_private_key_pem(text: const u8[:]) -> PrivateKey, bool {
     let ders, ok = asn1::pem_decode(text, "");
     for d in ders {
@@ -158,7 +240,7 @@ fn put_limbs_uint(out: u8[>..]&, xs) {
 fn seq(out: u8[>..]&, content: const u8[:]) { asn1::put(out, asn1::SEQUENCE, content); }
 
 // The public key as its subjectPublicKey contents: RSAPublicKey DER, the
-// uncompressed EC point, or the Ed25519 key.
+// uncompressed EC point, the Ed25519 or ML-DSA key, or the DSA INTEGER y.
 fn public_key_bytes(k: const PrivateKey&) -> u8[>..] {
     var out: u8[>..] = [];
     if k.kind == KEY_RSA {
@@ -167,7 +249,11 @@ fn public_key_bytes(k: const PrivateKey&) -> u8[>..] {
         put_limbs_uint(body, k.rsa.e);
         seq(out, body);
     } else if k.kind == KEY_ED25519 {
-        out.append(bignum::ed25519_public(k.ed_seed));
+        out.append(bignum::ed25519_public(k.seed));
+    } else if is_mldsa(k.kind) {
+        out = bignum::mldsa_public_key(mldsa_set(k.kind), k.seed);
+    } else if k.kind == KEY_DSA {
+        asn1::put_uint(out, k.dsa.y);
     } else {
         let c = curve_of_key(k.kind);
         out = bignum::ec_public_key(c, k.ec_sk);
@@ -175,14 +261,28 @@ fn public_key_bytes(k: const PrivateKey&) -> u8[>..] {
     return out;
 }
 
+fn mldsa_oid(set: i64) -> const u8[:] {
+    if set == 44 { "2.16.840.1.101.3.4.3.17" } else if set == 65 { "2.16.840.1.101.3.4.3.18" } else { "2.16.840.1.101.3.4.3.19" }
+}
+
 // The public key's AlgorithmIdentifier.
-fn key_alg_id(kind: i64) -> u8[>..] {
+fn key_alg_id(k: const PrivateKey&) -> u8[>..] {
+    let kind = k.kind;
     var body: u8[>..] = [];
     if kind == KEY_RSA {
         asn1::put_oid(body, "1.2.840.113549.1.1.1");
         asn1::put_null(body);
     } else if kind == KEY_ED25519 {
         asn1::put_oid(body, "1.3.101.112");
+    } else if is_mldsa(kind) {
+        asn1::put_oid(body, mldsa_oid(mldsa_set(kind)));
+    } else if kind == KEY_DSA {
+        asn1::put_oid(body, "1.2.840.10040.4.1");
+        var params: u8[>..] = [];
+        asn1::put_uint(params, k.dsa.p);
+        asn1::put_uint(params, k.dsa.q);
+        asn1::put_uint(params, k.dsa.g);
+        seq(body, params);
     } else {
         asn1::put_oid(body, "1.2.840.10045.2.1");
         asn1::put_oid(body, curve_oid(kind));
@@ -194,7 +294,7 @@ fn key_alg_id(kind: i64) -> u8[>..] {
 
 // SubjectPublicKeyInfo (MarshalPKIXPublicKey).
 fn marshal_public_key(k: const PrivateKey&) -> u8[>..] {
-    var body = key_alg_id(k.kind);
+    var body = key_alg_id(k);
     asn1::put_bits(body, public_key_bytes(k));
     var out: u8[>..] = [];
     seq(out, body);
@@ -245,10 +345,12 @@ fn marshal_sec1(k: const PrivateKey&) -> u8[>..] { marshal_ec(k, true) }
 fn marshal_pkcs8(k: const PrivateKey&) -> u8[>..] {
     var body: u8[>..] = [];
     asn1::put_i64(body, 0);
-    body.append(key_alg_id(k.kind));
+    body.append(key_alg_id(k));
     var inner: u8[>..] = [];
     if k.kind == KEY_RSA { inner = marshal_pkcs1(k); }
-    else if k.kind == KEY_ED25519 { asn1::put_octets(inner, k.ed_seed); }
+    else if k.kind == KEY_ED25519 { asn1::put_octets(inner, k.seed); }
+    else if is_mldsa(k.kind) { asn1::put(inner, asn1::ctx(0, false), k.seed); }
+    else if k.kind == KEY_DSA { asn1::put_uint(inner, k.dsa.x); }
     else { inner = marshal_ec(k, false); }
     asn1::put_octets(body, inner);
     var out: u8[>..] = [];
@@ -260,10 +362,12 @@ fn marshal_pkcs8(k: const PrivateKey&) -> u8[>..] {
 
 // The signature algorithm a key signs with by default: PKCS #1 v1.5 with
 // SHA-256 for RSA (as Go), ECDSA with the curve's hash (SHA-256 for P-224,
-// as Go), Ed25519.
+// as Go), Ed25519, ML-DSA of the key's set, DSA with SHA-256 (as openssl).
 fn default_sig(kind: i64) -> i64, i64 {
     if kind == KEY_RSA { return SIG_RSA_PKCS1, 256; }
     if kind == KEY_ED25519 { return SIG_ED25519, 0; }
+    if is_mldsa(kind) { return SIG_MLDSA, mldsa_set(kind); }
+    if kind == KEY_DSA { return SIG_DSA, 256; }
     if kind == KEY_EC_P256 || kind == KEY_EC_P224 { return SIG_ECDSA, 256; }
     if kind == KEY_EC_P384 { return SIG_ECDSA, 384; }
     return SIG_ECDSA, 512;
@@ -283,6 +387,11 @@ fn sig_alg_id(alg: i64, h: i64) -> u8[>..] {
         asn1::put_oid(body, if h == 256 { "1.2.840.10045.4.3.2" } else if h == 384 { "1.2.840.10045.4.3.3" } else { "1.2.840.10045.4.3.4" });
     } else if alg == SIG_ED25519 {
         asn1::put_oid(body, "1.3.101.112");
+    } else if alg == SIG_MLDSA {
+        asn1::put_oid(body, mldsa_oid(h));
+    } else if alg == SIG_DSA {
+        asn1::put_oid(body, if h == 224 { "2.16.840.1.101.3.4.3.1" } else if h == 256 { "2.16.840.1.101.3.4.3.2" }
+                            else if h == 384 { "2.16.840.1.101.3.4.3.3" } else { "2.16.840.1.101.3.4.3.4" });
     } else {
         // RSASSA-PSS-params: the hash, MGF1 over it, a salt as long as it.
         asn1::put_oid(body, "1.2.840.113549.1.1.10");
@@ -314,17 +423,22 @@ fn sig_fits_key(kind: i64, alg: i64, h: i64) -> bool {
     if alg == SIG_RSA_PKCS1 || alg == SIG_RSA_PSS { return kind == KEY_RSA && (h == 256 || h == 384 || h == 512); }
     if alg == SIG_ECDSA { return is_ec(kind) && (h == 256 || h == 384 || h == 512); }
     if alg == SIG_ED25519 { return kind == KEY_ED25519; }
+    if alg == SIG_MLDSA { return is_mldsa(kind) && mldsa_set(kind) == h; }
+    if alg == SIG_DSA { return kind == KEY_DSA && (h == 224 || h == 256 || h == 384 || h == 512); }
     return false;
 }
 
 // A signature over msg: PKCS #1 v1.5 or PSS (salt as long as the hash),
-// ECDSA as a DER SEQUENCE (RFC 6979 nonces), or Ed25519.
+// ECDSA or DSA as a DER SEQUENCE (RFC 6979 nonces), Ed25519, or ML-DSA
+// (hedged, with the empty context).
 fn sign(k: const PrivateKey&, alg: i64, h: i64, msg: const u8[:]) -> u8[>..] {
     assert(sig_fits_key(k.kind, alg, h));
     var out: u8[>..] = [];
     if alg == SIG_RSA_PKCS1 { return bignum::rsa_sign_pkcs1(k.rsa, msg, h); }
     if alg == SIG_RSA_PSS { return bignum::rsa_sign_pss(k.rsa, msg, -1, h); }
-    if alg == SIG_ED25519 { out.append(bignum::ed25519_sign(k.ed_seed, msg)); return out; }
+    if alg == SIG_ED25519 { out.append(bignum::ed25519_sign(k.seed, msg)); return out; }
+    if alg == SIG_MLDSA { return bignum::mldsa_sign(h, k.seed, msg); }
+    if alg == SIG_DSA { return bignum::dsa_sig_to_der(bignum::dsa_sign_deterministic(k.dsa, bignum::hash_bits(h, msg), h)); }
     let c = curve_of_key(k.kind);
     // ecdsa_sign hashes with the curve's own hash; any other goes through
     // the digest.

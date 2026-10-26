@@ -16,6 +16,8 @@ import bignum.rsa;
 import bignum.ec;
 import bignum.ed25519;
 import bignum.hmac;
+import bignum.mldsa;
+import bignum.dsa;
 
 // Errors, from parsing or validation; OK is 0.
 let OK: i64 = 0;
@@ -65,6 +67,8 @@ let SIG_RSA_PKCS1: i64 = 1;          // with sig_hash
 let SIG_RSA_PSS: i64 = 2;            // with sig_hash and pss_salt
 let SIG_ECDSA: i64 = 3;              // with sig_hash
 let SIG_ED25519: i64 = 4;
+let SIG_MLDSA: i64 = 5;              // sig_hash holds the parameter set: 44, 65 or 87
+let SIG_DSA: i64 = 6;                // with sig_hash (224, 256, 384, 512)
 
 // Public key types.
 let KEY_UNKNOWN: i64 = 0;
@@ -74,6 +78,10 @@ let KEY_EC_P384: i64 = 3;
 let KEY_ED25519: i64 = 4;
 let KEY_EC_P521: i64 = 5;
 let KEY_EC_P224: i64 = 6;
+let KEY_MLDSA44: i64 = 7;
+let KEY_MLDSA65: i64 = 8;
+let KEY_MLDSA87: i64 = 9;
+let KEY_DSA: i64 = 10;
 
 // Key usage bits (RFC 5280 §4.2.1.3), as KU_* masks of Cert.key_usage.
 let KU_DIGITAL_SIGNATURE: u32 = 1;
@@ -206,6 +214,12 @@ fn sig_alg_of(der: const u8[:], t: asn1::Tlv) -> i64, i64, i64 {
         if asn1::oid_is(der, oid, "1.2.840.10045.4.3.3") { return SIG_ECDSA, 384, 0; }
         if asn1::oid_is(der, oid, "1.2.840.10045.4.3.4") { return SIG_ECDSA, 512, 0; }
         if asn1::oid_is(der, oid, "1.3.101.112") { return SIG_ED25519, 0, 0; }
+        let set = mldsa_set_of_oid(der, oid);
+        if set != 0 { return SIG_MLDSA, set, 0; }
+        if asn1::oid_is(der, oid, "2.16.840.1.101.3.4.3.1") { return SIG_DSA, 224, 0; }
+        if asn1::oid_is(der, oid, "2.16.840.1.101.3.4.3.2") { return SIG_DSA, 256, 0; }
+        if asn1::oid_is(der, oid, "2.16.840.1.101.3.4.3.3") { return SIG_DSA, 384, 0; }
+        if asn1::oid_is(der, oid, "2.16.840.1.101.3.4.3.4") { return SIG_DSA, 512, 0; }
     }
     if p.len == 2 && asn1::oid_is(der, oid, "1.2.840.113549.1.1.10") {
         let h, salt, okp = pss_params(der, p[1]);
@@ -222,6 +236,20 @@ fn ec_named_curve(der: const u8[:], o: asn1::Tlv) -> i64 {
     if asn1::oid_is(der, o, "1.3.132.0.33") { return KEY_EC_P224; }
     return KEY_UNKNOWN;
 }
+
+// The ML-DSA parameter set (44, 65, 87) of an id-ml-dsa-* OID, or 0.
+fn mldsa_set_of_oid(der: const u8[:], o: asn1::Tlv) -> i64 {
+    if asn1::oid_is(der, o, "2.16.840.1.101.3.4.3.17") { return 44; }
+    if asn1::oid_is(der, o, "2.16.840.1.101.3.4.3.18") { return 65; }
+    if asn1::oid_is(der, o, "2.16.840.1.101.3.4.3.19") { return 87; }
+    return 0;
+}
+
+fn is_mldsa(kind: i64) -> bool { kind == KEY_MLDSA44 || kind == KEY_MLDSA65 || kind == KEY_MLDSA87 }
+
+// The parameter set of an ML-DSA key type, and back.
+fn mldsa_set(kind: i64) -> i64 { if kind == KEY_MLDSA44 { 44 } else if kind == KEY_MLDSA65 { 65 } else { 87 } }
+fn mldsa_kind(set: i64) -> i64 { if set == 44 { KEY_MLDSA44 } else if set == 65 { KEY_MLDSA65 } else { KEY_MLDSA87 } }
 
 fn is_ec(kind: i64) -> bool {
     kind == KEY_EC_P256 || kind == KEY_EC_P384 || kind == KEY_EC_P521 || kind == KEY_EC_P224
@@ -249,8 +277,43 @@ fn spki_of(der: const u8[:], t: asn1::Tlv) -> i64, asn1::Tlv, bool {
         kind = ec_named_curve(der, alg[1]);
     } else if asn1::oid_is(der, alg[0], "1.3.101.112") && alg.len == 1 {
         kind = KEY_ED25519;
+    } else if mldsa_set_of_oid(der, alg[0]) != 0 && alg.len == 1 {
+        kind = mldsa_kind(mldsa_set_of_oid(der, alg[0]));
+    } else if asn1::oid_is(der, alg[0], "1.2.840.10040.4.1") && alg.len == 2 {
+        // Parameters inherited from the issuer (absent) are not supported.
+        kind = KEY_DSA;
     }
     return kind, p[1], true;
+}
+
+// Dss-Parms ::= SEQUENCE { p, q, g INTEGER }.
+fn dss_parms(der: const u8[:], t: asn1::Tlv) -> u8[>..], u8[>..], u8[>..], bool {
+    var none: u8[>..] = [];
+    let f, ok = asn1::children_of(der, t, asn1::SEQUENCE);
+    if !ok || f.len != 3 { return none, none, none, false; }
+    let p, ok1 = asn1::read_uint(der, f[0]);
+    let q, ok2 = asn1::read_uint(der, f[1]);
+    let g, ok3 = asn1::read_uint(der, f[2]);
+    return p, q, g, ok1 && ok2 && ok3;
+}
+
+// The DSA public key of a SubjectPublicKeyInfo: its parameters and the
+// subjectPublicKey INTEGER y.
+fn dsa_public_of(der: const u8[:], spki: asn1::Tlv) -> bignum::DsaKey, bool {
+    var none = bignum::DsaKey { p: [], q: [], g: [], y: [], x: [] };
+    let f, ok = asn1::children_of(der, spki, asn1::SEQUENCE);
+    if !ok || f.len != 2 { return none, false; }
+    let alg, oka = asn1::children_of(der, f[0], asn1::SEQUENCE);
+    if !oka || alg.len != 2 { return none, false; }
+    let p, q, g, okp = dss_parms(der, alg[1]);
+    let kb, okb = key_bytes(der, f[1]);
+    if !okp || !okb { return none, false; }
+    let yt, oky = asn1::parse(kb);
+    if !oky { return none, false; }
+    let y, oki = asn1::read_uint(kb, yt);
+    if !oki { return none, false; }
+    let k, okk = bignum::dsa_key_from(p, q, g, y);
+    return k, okk;
 }
 
 // The key bytes of a BIT STRING without unused bits.
@@ -784,6 +847,20 @@ fn verify_with(key_cert: const Cert&, alg: i64, h: i64, salt: i64, msg: const u8
         if key_cert.key_type != KEY_ED25519 { return ERR_BAD_SIGNATURE; }
         return if bignum::ed25519_verify(kb, msg, sig) { OK } else { ERR_BAD_SIGNATURE };
     }
+    if alg == SIG_MLDSA {
+        // Pure ML-DSA with the empty context (RFC 9881); the set must be the key's.
+        if !is_mldsa(key_cert.key_type) || mldsa_set(key_cert.key_type) != h { return ERR_BAD_SIGNATURE; }
+        if kb.len != bignum::mldsa_pk_len(h) { return ERR_MALFORMED; }
+        return if bignum::mldsa_verify(h, kb, msg, sig) { OK } else { ERR_BAD_SIGNATURE };
+    }
+    if alg == SIG_DSA {
+        if key_cert.key_type != KEY_DSA { return ERR_BAD_SIGNATURE; }
+        let k, okd = dsa_public_of(d, key_cert.spki);
+        if !okd { return ERR_MALFORMED; }
+        let raw, okr = bignum::dsa_sig_from_der(k, sig);
+        if !okr { return ERR_BAD_SIGNATURE; }
+        return if bignum::dsa_verify(k, bignum::hash_bits(h, msg), raw) { OK } else { ERR_BAD_SIGNATURE };
+    }
     return ERR_UNSUPPORTED_ALGORITHM;
 }
 
@@ -807,6 +884,12 @@ let RSA_PSS_RSAE_SHA256: u16 = 0x0804;
 let RSA_PSS_RSAE_SHA384: u16 = 0x0805;
 let RSA_PSS_RSAE_SHA512: u16 = 0x0806;
 let ED25519: u16 = 0x0807;
+let MLDSA44: u16 = 0x0904;
+let MLDSA65: u16 = 0x0905;
+let MLDSA87: u16 = 0x0906;
+
+// The ML-DSA SignatureScheme of a parameter set.
+fn mldsa_scheme(set: i64) -> u16 { if set == 44 { MLDSA44 } else if set == 65 { MLDSA65 } else { MLDSA87 } }
 
 // Verifies a TLS signature (CertificateVerify, say) made with c's key
 // under a SignatureScheme. ECDSA schemes bind the curve, as TLS 1.3 does.
@@ -830,6 +913,9 @@ fn verify_scheme(c: const Cert&, scheme: u16, msg: const u8[:], sig: const u8[:]
         return verify_with(c, SIG_ECDSA, 512, 0, msg, sig);
     }
     if scheme == ED25519 { return verify_with(c, SIG_ED25519, 0, 0, msg, sig); }
+    if scheme == MLDSA44 { return verify_with(c, SIG_MLDSA, 44, 0, msg, sig); }
+    if scheme == MLDSA65 { return verify_with(c, SIG_MLDSA, 65, 0, msg, sig); }
+    if scheme == MLDSA87 { return verify_with(c, SIG_MLDSA, 87, 0, msg, sig); }
     return ERR_UNSUPPORTED_ALGORITHM;
 }
 

@@ -7,7 +7,9 @@ verify each leaf (x509_strict, sslserver, host name, explicit policy),
 refuse the leaf outside the intermediate's name constraints, verify the
 CSR's signature and both CRLs, find the revoked leaf revoked under
 -crl_check_all and the others not, and read every private key, whose
-public key must be the one in its certificate.
+public key must be the one in its certificate; the same for the ML-DSA
+and DSA hierarchy. Go's crypto/x509 (scripts/govectors `check`) must
+verify the ML-DSA leaves and read their PKCS #8 keys.
 
     python3 scripts/check_created.py [--goose PATH]
 """
@@ -70,6 +72,23 @@ def main():
     expect("revoked leaf", ossl(*crl, f("leaf_ed25519.pem")), False, "revoked")
     expect("unrevoked leaf", ossl(*crl, f("leaf_p256.pem")), True)
     expect("root key parses", ossl("pkey", "-in", f("root.key"), "-noout"), True)
+    for leaf, root in (("leaf_mldsa44", "pq_root"), ("leaf_mldsa87", "pq_root"), ("leaf_dsa", "pq_root"),
+                       ("leaf_by_dsa", "dsa_root")):
+        expect(f"{leaf} verifies", ossl("verify", "-x509_strict", "-purpose", "sslserver", "-CAfile", f(root + ".pem"),
+                                        "-verify_hostname", "www.example.com", f(leaf + ".pem")), True)
+    for leaf in ("leaf_mldsa44", "leaf_mldsa87", "leaf_dsa"):
+        pub_cert = ossl("x509", "-in", f(leaf + ".pem"), "-noout", "-pubkey").stdout
+        pub_key = ossl("pkey", "-in", f(leaf + ".key"), "-pubout").stdout
+        results.append(pub_cert == pub_key and pub_cert != "")
+        print(("ok    " if results[-1] else "FAIL  ") + f"{leaf} key matches certificate")
+    expect("ML-DSA leaf under the DSA root refused", ossl("verify", "-CAfile", f("dsa_root.pem"),
+                                                          f("leaf_mldsa44.pem")), False)
+    expect("ML-DSA csr signature", ossl("req", "-in", f("csr_mldsa.pem"), "-verify", "-noout"), True, "verify OK")
+    expect("ML-DSA crl", ossl("crl", "-in", f("crl_pq.pem"), "-CAfile", f("pq_root.pem"), "-noout"), True, "verify OK")
+    # Go's crypto/x509 too, for the ML-DSA certificates (it checks no DSA signatures).
+    go = subprocess.run(["go", "run", ".", "check", d], cwd=os.path.join(ROOT, "scripts", "govectors"),
+                        env={**os.environ, "GOFLAGS": "-mod=mod", "GOPROXY": "off"}, capture_output=True, text=True)
+    expect("Go verifies the ML-DSA leaves and reads their keys", go, True, "ok")
     expect("text dump", ossl("x509", "-in", f("int.pem"), "-noout", "-text"), True, "Permitted:")
     shutil.rmtree(d)
     print(f"\n{sum(results)} passed, {len(results) - sum(results)} failed")

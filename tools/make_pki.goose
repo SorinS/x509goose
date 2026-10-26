@@ -4,8 +4,9 @@
 // Ed25519, P-256 (signed RSA PKCS #1 v1.5 SHA-384), P-521 (RSA-PSS
 // SHA-512) and P-224 keys, a P-224 intermediate and a leaf it signs, a
 // leaf outside the name constraints, a CSR, a CRL from
-// each CA (the intermediate's revokes the Ed25519 leaf), and every
-// private key in PKCS #8.
+// each CA (the intermediate's revokes the Ed25519 leaf), an ML-DSA-65
+// root with ML-DSA-44, ML-DSA-87 and DSA leaves, an ML-DSA CSR and CRL, a
+// DSA root with a leaf, and every leaf's private key in PKCS #8.
 //
 //   goose tools/make_pki.goose -- <dir> <intermediate-key.der>
 import std;
@@ -110,5 +111,42 @@ fn main() {
     let rcrl, erc = x509::create_crl(root, root_key, empty, now - 600, now + 86400, 1);
     assert(erc == x509::OK);
     save(dir, "crl_root.pem", "X509 CRL", rcrl);
+    // A post-quantum hierarchy: an ML-DSA-65 root, leaves on ML-DSA-44,
+    // ML-DSA-87 and DSA keys, a CSR and a CRL signed with ML-DSA; and a
+    // DSA root with a leaf it signs.
+    let pq_key = x509::generate_key(x509::KEY_MLDSA65);
+    var pt, okpt = x509::template("CN=Goose Made ML-DSA Root,O=Goose", now - 3600, now + 10 * year);
+    pt.is_ca = true;
+    pt.key_usage = x509::KU_KEY_CERT_SIGN | x509::KU_CRL_SIGN;
+    let pq_root, epq = x509::create_certificate(pt, x509::marshal_public_key(pq_key), "", pq_key);
+    assert(epq == x509::OK);
+    save(dir, "pq_root.pem", "CERTIFICATE", pq_root);
+    let dsa_key = x509::generate_key(x509::KEY_DSA);
+    var dt, okdt = x509::template("CN=Goose Made DSA Root,O=Goose", now - 3600, now + 10 * year);
+    dt.is_ca = true;
+    dt.key_usage = x509::KU_KEY_CERT_SIGN | x509::KU_CRL_SIGN;
+    let dsa_root, edr = x509::create_certificate(dt, x509::marshal_public_key(dsa_key), "", dsa_key);
+    assert(edr == x509::OK);
+    save(dir, "dsa_root.pem", "CERTIFICATE", dsa_root);
+    let pq_kinds: i64[4] = [x509::KEY_MLDSA44, x509::KEY_MLDSA87, x509::KEY_DSA, x509::KEY_EC_P256];
+    let pq_names = ["leaf_mldsa44", "leaf_mldsa87", "leaf_dsa", "leaf_by_dsa"];
+    for i in 4 {
+        let lk = x509::generate_key(pq_kinds[i]);
+        var lt, oklt = x509::template("CN=www.example.com,O=Goose", now - 3600, now + year);
+        lt.key_usage = x509::KU_DIGITAL_SIGNATURE;
+        lt.ext_key_usage = x509::EKU_SERVER_AUTH;
+        x509::add_dns(lt.san, "www.example.com");
+        let by_dsa = i == 3;
+        let leaf, el = x509::create_certificate(lt, x509::marshal_public_key(lk), if by_dsa { dsa_root } else { pq_root },
+                                                if by_dsa { dsa_key } else { pq_key });
+        assert(el == x509::OK);
+        save(dir, str(pq_names[i], ".pem"), "CERTIFICATE", leaf);
+        save(dir, str(pq_names[i], ".key"), "PRIVATE KEY", x509::marshal_pkcs8(lk));
+    }
+    let pq_csr_key = x509::generate_key(x509::KEY_MLDSA44);
+    save(dir, "csr_mldsa.pem", "CERTIFICATE REQUEST", x509::create_csr(subj, san, pq_csr_key));
+    let pq_crl, epc = x509::create_crl(pq_root, pq_key, empty, now - 600, now + 86400, 1);
+    assert(epc == x509::OK);
+    save(dir, "crl_pq.pem", "X509 CRL", pq_crl);
     print("ok");
 }
