@@ -61,7 +61,7 @@ scalar or an `asn1::Tlv` into that copy:
 | Signatures | Keys |
 |---|---|
 | RSA PKCS #1 v1.5 with SHA-256, SHA-384, SHA-512 | RSA (up to 4096 bits) |
-| RSASSA-PSS with SHA-256, SHA-384, SHA-512 (MGF1 on the same hash) | ECDSA P-256, P-384, P-521 |
+| RSASSA-PSS with SHA-256, SHA-384, SHA-512 (MGF1 on the same hash) | ECDSA P-224, P-256, P-384, P-521 |
 | ECDSA with SHA-256, SHA-384, SHA-512 | Ed25519 |
 | Ed25519 | |
 
@@ -139,7 +139,7 @@ builds. If they fail, it keeps searching for another path.
 
 ## Keys
 
-`PrivateKey` holds an RSA key, an EC scalar (P-256, P-384, P-521) or an
+`PrivateKey` holds an RSA key, an EC scalar (P-224, P-256, P-384, P-521) or an
 Ed25519 seed. These correspond to Go's functions:
 
 | Go | Here |
@@ -216,13 +216,15 @@ python3 scripts/gen_vectors.py          # regenerate the vectors with openssl
   fail under other schemes or when changed.
 - `keys_create`: openssl's keys must round-trip through every DER form.
   A PKI made here is then checked: a root, a constrained intermediate,
-  leaves on Ed25519, P-256 and P-521 signed with RSA PKCS #1 v1.5 and
-  RSA-PSS, a certificate issued from a CSR, and CRLs. Fields must read
+  leaves on Ed25519, P-256, P-521 and P-224 signed with RSA PKCS #1 v1.5
+  and RSA-PSS, a P-224 intermediate signing with ECDSA, a certificate
+  issued from a CSR, and CRLs. Fields must read
   back, paths must validate (or fail on a name constraint or a
   revocation), and misuse must be refused.
-- `scripts/check_created.py` hands such a PKI to openssl (24 checks):
+- `scripts/check_created.py` hands such a PKI to openssl (30 checks):
   - each leaf verifies strictly for the host and under an explicit
     policy, and is refused under another policy or host;
+  - a leaf under the P-224 intermediate verifies;
   - the name constraints are enforced;
   - the CSR and both CRLs verify;
   - `-crl_check_all` finds the listed leaf revoked and the others good;

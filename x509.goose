@@ -73,6 +73,7 @@ let KEY_EC_P256: i64 = 2;
 let KEY_EC_P384: i64 = 3;
 let KEY_ED25519: i64 = 4;
 let KEY_EC_P521: i64 = 5;
+let KEY_EC_P224: i64 = 6;
 
 // Key usage bits (RFC 5280 §4.2.1.3), as KU_* masks of Cert.key_usage.
 let KU_DIGITAL_SIGNATURE: u32 = 1;
@@ -213,6 +214,28 @@ fn sig_alg_of(der: const u8[:], t: asn1::Tlv) -> i64, i64, i64 {
     return SIG_UNKNOWN, 0, 0;
 }
 
+// The key type of an EC named-curve OID, or KEY_UNKNOWN.
+fn ec_named_curve(der: const u8[:], o: asn1::Tlv) -> i64 {
+    if asn1::oid_is(der, o, "1.2.840.10045.3.1.7") { return KEY_EC_P256; }
+    if asn1::oid_is(der, o, "1.3.132.0.34") { return KEY_EC_P384; }
+    if asn1::oid_is(der, o, "1.3.132.0.35") { return KEY_EC_P521; }
+    if asn1::oid_is(der, o, "1.3.132.0.33") { return KEY_EC_P224; }
+    return KEY_UNKNOWN;
+}
+
+fn is_ec(kind: i64) -> bool {
+    kind == KEY_EC_P256 || kind == KEY_EC_P384 || kind == KEY_EC_P521 || kind == KEY_EC_P224
+}
+
+// The curve of an EC key type.
+fn curve_of_key(kind: i64) -> bignum::Curve {
+    assert(is_ec(kind));
+    if kind == KEY_EC_P256 { return bignum::p256(); }
+    if kind == KEY_EC_P384 { return bignum::p384(); }
+    if kind == KEY_EC_P224 { return bignum::p224(); }
+    return bignum::p521();
+}
+
 // The key type of a SubjectPublicKeyInfo, and its subjectPublicKey.
 fn spki_of(der: const u8[:], t: asn1::Tlv) -> i64, asn1::Tlv, bool {
     let p, ok = asn1::children_of(der, t, asn1::SEQUENCE);
@@ -223,9 +246,7 @@ fn spki_of(der: const u8[:], t: asn1::Tlv) -> i64, asn1::Tlv, bool {
     if asn1::oid_is(der, alg[0], "1.2.840.113549.1.1.1") && alg.len == 2 && asn1::read_null(der, alg[1]) {
         kind = KEY_RSA;
     } else if asn1::oid_is(der, alg[0], "1.2.840.10045.2.1") && alg.len == 2 {
-        if asn1::oid_is(der, alg[1], "1.2.840.10045.3.1.7") { kind = KEY_EC_P256; }
-        if asn1::oid_is(der, alg[1], "1.3.132.0.34") { kind = KEY_EC_P384; }
-        if asn1::oid_is(der, alg[1], "1.3.132.0.35") { kind = KEY_EC_P521; }
+        kind = ec_named_curve(der, alg[1]);
     } else if asn1::oid_is(der, alg[0], "1.3.101.112") && alg.len == 1 {
         kind = KEY_ED25519;
     }
@@ -752,11 +773,8 @@ fn verify_with(key_cert: const Cert&, alg: i64, h: i64, salt: i64, msg: const u8
         return if good { OK } else { ERR_BAD_SIGNATURE };
     }
     if alg == SIG_ECDSA {
-        if key_cert.key_type != KEY_EC_P256 && key_cert.key_type != KEY_EC_P384 && key_cert.key_type != KEY_EC_P521 {
-            return ERR_BAD_SIGNATURE;
-        }
-        let curve = if key_cert.key_type == KEY_EC_P256 { bignum::p256() }
-                    else if key_cert.key_type == KEY_EC_P384 { bignum::p384() } else { bignum::p521() };
+        if !is_ec(key_cert.key_type) { return ERR_BAD_SIGNATURE; }
+        let curve = curve_of_key(key_cert.key_type);
         let raw, okd = bignum::ecdsa_sig_from_der(curve, sig);
         if !okd { return ERR_BAD_SIGNATURE; }
         let good = bignum::ecdsa_verify_digest(curve, kb, bignum::hash_bits(h, msg), raw);

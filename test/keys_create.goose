@@ -50,7 +50,7 @@ let YEAR: i64 = 31536000;
 
 fn main() {
     // Keys: parse and marshal against openssl's bytes.
-    for kind in ["rsa", "p256", "p384", "p521", "ed25519"] {
+    for kind in ["rsa", "p256", "p384", "p521", "ed25519", "p224"] {
         let pkcs8 = key_line(kind, 2);
         let native = key_line(kind, 3);
         let spki = key_line(kind, 4);
@@ -99,10 +99,10 @@ fn main() {
     for u in x509::crl_urls(ic) { urls_ok = u == "http://crl.example.com/issuing.crl"; }
     check("crl url", urls_ok);
 
-    // Leaves on three key types; the P-521 one through the RSA-PSS path.
+    // Leaves on four key types; the P-521 one through the RSA-PSS path.
     var leaves: u8[][>..] = [];
-    var keys_made: i64[3] = [x509::KEY_ED25519, x509::KEY_EC_P256, x509::KEY_EC_P521];
-    for i in 3 {
+    var keys_made: i64[4] = [x509::KEY_ED25519, x509::KEY_EC_P256, x509::KEY_EC_P521, x509::KEY_EC_P224];
+    for i in 4 {
         let lk = x509::generate_key(keys_made[i]);
         var lt, oklt = x509::template("CN=www.example.com", NOW - 10, NOW + YEAR);
         lt.basic_constraints = true;
@@ -139,6 +139,25 @@ fn main() {
         a
     };
     check("pss alg", pss_leaf_alg == x509::SIG_RSA_PSS);
+
+    // A P-224 intermediate under the root, signing with ECDSA and SHA-256
+    // as Go does, and a leaf it issues.
+    let k224 = x509::generate_key(x509::KEY_EC_P224);
+    var t224, ok224 = x509::template("CN=Goose P-224 Issuing", NOW - YEAR, NOW + 5 * YEAR);
+    t224.is_ca = true;
+    t224.key_usage = x509::KU_KEY_CERT_SIGN;
+    let int224, e224 = x509::create_certificate(t224, x509::marshal_public_key(k224), root, root_key);
+    let lk224 = x509::generate_key(x509::KEY_EC_P256);
+    var lt224, oklt224 = x509::template("CN=p224.example.com", NOW - 10, NOW + YEAR);
+    x509::add_dns(lt224.san, "p224.example.com");
+    let leaf224, el224 = x509::create_certificate(lt224, x509::marshal_public_key(lk224), int224, k224);
+    let c224, ec224 = x509::parse(leaf224);
+    check("p224 issuer", e224 == x509::OK && el224 == x509::OK && ec224 == x509::OK
+          && c224.sig_alg == x509::SIG_ECDSA && c224.sig_hash == 256
+          && x509::verify_chain(leaf224, int224, root, NOW, "p224.example.com") == x509::OK);
+    var bad224 = copy(leaf224);
+    bad224[bad224.len - 5] ^= 1;
+    check("p224 bad signature", x509::verify_chain(bad224, int224, root, NOW, "") != x509::OK);
 
     // Name constraints bind what the intermediate issues.
     let bk = x509::generate_key(x509::KEY_EC_P256);

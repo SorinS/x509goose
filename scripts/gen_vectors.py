@@ -69,6 +69,7 @@ class PKI:
                 "p256": ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256"],
                 "p384": ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-384"],
                 "p521": ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-521"],
+                "p224": ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-224"],
                 "ed25519": ["-algorithm", "ED25519"]}[kind]
         ossl("genpkey", *args, "-out", self.path(f"{name}.key"))
 
@@ -408,7 +409,8 @@ def main():
                            ("p256", ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256"]),
                            ("p384", ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-384"]),
                            ("p521", ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-521"]),
-                           ("ed25519", ["-algorithm", "ED25519"])]:
+                           ("ed25519", ["-algorithm", "ED25519"]),
+                           ("p224", ["-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-224"])]:
             kp = os.path.join(tmp, kind + ".pem")
             ossl("genpkey", *args, "-out", kp)
             pkcs8 = ossl("pkey", "-in", kp, "-outform", "DER").stdout

@@ -25,14 +25,9 @@ fn empty_key() -> PrivateKey {
                  rsa: bignum::RsaPrivateKey { n: [], e: [], d: [], p: [], q: [], dp: [], dq: [], qinv: [] } }
 }
 
-fn curve_of_key(kind: i64) -> bignum::Curve {
-    if kind == KEY_EC_P256 { bignum::p256() } else if kind == KEY_EC_P384 { bignum::p384() } else { bignum::p521() }
-}
-
-fn is_ec(kind: i64) -> bool { kind == KEY_EC_P256 || kind == KEY_EC_P384 || kind == KEY_EC_P521 }
-
 fn curve_oid(kind: i64) -> const u8[:] {
-    if kind == KEY_EC_P256 { "1.2.840.10045.3.1.7" } else if kind == KEY_EC_P384 { "1.3.132.0.34" } else { "1.3.132.0.35" }
+    if kind == KEY_EC_P256 { "1.2.840.10045.3.1.7" } else if kind == KEY_EC_P384 { "1.3.132.0.34" }
+    else if kind == KEY_EC_P224 { "1.3.132.0.33" } else { "1.3.132.0.35" }
 }
 
 // A new key from the OS's entropy; rsa_bits for RSA keys.
@@ -85,9 +80,7 @@ fn parse_ec_private(k: PrivateKey&, d: const u8[:], t: asn1::Tlv, curve: i64) ->
     for x in f[2..] {
         if x.tag == asn1::ctx(0, true) {
             let o, oko = asn1::explicit(d, x);
-            let named = if asn1::oid_is(d, o, "1.2.840.10045.3.1.7") { KEY_EC_P256 }
-                        else if asn1::oid_is(d, o, "1.3.132.0.34") { KEY_EC_P384 }
-                        else if asn1::oid_is(d, o, "1.3.132.0.35") { KEY_EC_P521 } else { KEY_UNKNOWN };
+            let named = ec_named_curve(d, o);
             if named == KEY_UNKNOWN || (kind != KEY_UNKNOWN && kind != named) { return false; }
             kind = named;
         } else if x.tag != asn1::ctx(1, true) {
@@ -131,9 +124,7 @@ fn parse_private_key(d: const u8[:]) -> PrivateKey, bool {
             return k, true;
         }
         if asn1::oid_is(d, alg[0], "1.2.840.10045.2.1") && alg.len == 2 {
-            let curve = if asn1::oid_is(d, alg[1], "1.2.840.10045.3.1.7") { KEY_EC_P256 }
-                        else if asn1::oid_is(d, alg[1], "1.3.132.0.34") { KEY_EC_P384 }
-                        else if asn1::oid_is(d, alg[1], "1.3.132.0.35") { KEY_EC_P521 } else { KEY_UNKNOWN };
+            let curve = ec_named_curve(d, alg[1]);
             if curve == KEY_UNKNOWN { return k, false; }
             let oke = parse_ec_private(k, d, inner, curve);
             return k, oke;
@@ -268,11 +259,12 @@ fn marshal_pkcs8(k: const PrivateKey&) -> u8[>..] {
 // --- Signing ------------------------------------------------------------------
 
 // The signature algorithm a key signs with by default: PKCS #1 v1.5 with
-// SHA-256 for RSA (as Go), ECDSA with the curve's hash, Ed25519.
+// SHA-256 for RSA (as Go), ECDSA with the curve's hash (SHA-256 for P-224,
+// as Go), Ed25519.
 fn default_sig(kind: i64) -> i64, i64 {
     if kind == KEY_RSA { return SIG_RSA_PKCS1, 256; }
     if kind == KEY_ED25519 { return SIG_ED25519, 0; }
-    if kind == KEY_EC_P256 { return SIG_ECDSA, 256; }
+    if kind == KEY_EC_P256 || kind == KEY_EC_P224 { return SIG_ECDSA, 256; }
     if kind == KEY_EC_P384 { return SIG_ECDSA, 384; }
     return SIG_ECDSA, 512;
 }

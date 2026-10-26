@@ -44,7 +44,7 @@ def main():
         print(("ok    " if good else "FAIL  ") + label + ("" if good else "\n      " + (proc.stdout + proc.stderr).strip()))
 
     base = ["verify", "-x509_strict", "-purpose", "sslserver", "-CAfile", f("root.pem"), "-untrusted", f("int.pem")]
-    for leaf in ("leaf_ed25519", "leaf_p256", "leaf_p521"):
+    for leaf in ("leaf_ed25519", "leaf_p256", "leaf_p521", "leaf_p224"):
         expect(f"{leaf} verifies", ossl(*base, "-verify_hostname", "api.example.com", f(leaf + ".pem")), True)
         expect(f"{leaf} explicit policy", ossl(*base, "-policy_check", "-explicit_policy", "-policy",
                                                "1.3.6.1.4.1.55555.1", f(leaf + ".pem")), True)
@@ -55,6 +55,9 @@ def main():
         pub_key = ossl("pkey", "-in", f(leaf + ".key"), "-pubout").stdout
         results.append(pub_cert == pub_key and pub_cert != "")
         print(("ok    " if results[-1] else "FAIL  ") + f"{leaf} key matches certificate")
+    expect("leaf under the P-224 intermediate", ossl("verify", "-x509_strict", "-purpose", "sslserver", "-CAfile",
+                                                     f("root.pem"), "-untrusted", f("int_p224.pem"),
+                                                     "-verify_hostname", "www.example.com", f("leaf_by_p224.pem")), True)
     expect("name constraints enforced", ossl(*base, f("leaf_excluded.pem")), False, "excluded subtree")
     expect("csr signature", ossl("req", "-in", f("csr.pem"), "-verify", "-noout"), True, "verify OK")
     expect("csr san", ossl("req", "-in", f("csr.pem"), "-noout", "-text"), True, "DNS:csr.example.com")

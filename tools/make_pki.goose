@@ -1,8 +1,9 @@
 // Makes a small PKI with x509.create into a directory, for
 // scripts/check_created.py to check with openssl: a P-384 root, an RSA
 // intermediate (name constraints, a policy, a CRL URL), leaves on
-// Ed25519, P-256 (signed RSA PKCS #1 v1.5 SHA-384) and P-521 (RSA-PSS
-// SHA-512) keys, a leaf outside the name constraints, a CSR, a CRL from
+// Ed25519, P-256 (signed RSA PKCS #1 v1.5 SHA-384), P-521 (RSA-PSS
+// SHA-512) and P-224 keys, a P-224 intermediate and a leaf it signs, a
+// leaf outside the name constraints, a CSR, a CRL from
 // each CA (the intermediate's revokes the Ed25519 leaf), and every
 // private key in PKCS #8.
 //
@@ -49,10 +50,10 @@ fn main() {
     let inter, ei = x509::create_certificate(it, x509::marshal_public_key(int_key), root, root_key);
     assert(ei == x509::OK);
     save(dir, "int.pem", "CERTIFICATE", inter);
-    let kinds: i64[3] = [x509::KEY_ED25519, x509::KEY_EC_P256, x509::KEY_EC_P521];
-    let names = ["leaf_ed25519", "leaf_p256", "leaf_p521"];
+    let kinds: i64[4] = [x509::KEY_ED25519, x509::KEY_EC_P256, x509::KEY_EC_P521, x509::KEY_EC_P224];
+    let names = ["leaf_ed25519", "leaf_p256", "leaf_p521", "leaf_p224"];
     var revoked_serial: u8[..20] = [];
-    for i in 3 {
+    for i in 4 {
         let lk = x509::generate_key(kinds[i]);
         var lt, oklt = x509::template("CN=www.example.com,O=Goose", now - 3600, now + year);
         lt.basic_constraints = true;
@@ -72,6 +73,22 @@ fn main() {
             revoked_serial.append(c.der[c.serial.off..c.serial.end]);
         }
     }
+    // A P-224 intermediate, and a leaf it signs.
+    let k224 = x509::generate_key(x509::KEY_EC_P224);
+    var t224, ok224 = x509::template("CN=Goose P-224 Issuing,O=Goose", now - 3600, now + 5 * year);
+    t224.is_ca = true;
+    t224.key_usage = x509::KU_KEY_CERT_SIGN | x509::KU_CRL_SIGN;
+    let int224, e224 = x509::create_certificate(t224, x509::marshal_public_key(k224), root, root_key);
+    assert(e224 == x509::OK);
+    save(dir, "int_p224.pem", "CERTIFICATE", int224);
+    let lk224 = x509::generate_key(x509::KEY_EC_P256);
+    var lt224, oklt224 = x509::template("CN=www.example.com", now - 3600, now + year);
+    lt224.key_usage = x509::KU_DIGITAL_SIGNATURE;
+    lt224.ext_key_usage = x509::EKU_SERVER_AUTH;
+    x509::add_dns(lt224.san, "www.example.com");
+    let leaf224, el224 = x509::create_certificate(lt224, x509::marshal_public_key(lk224), int224, k224);
+    assert(el224 == x509::OK);
+    save(dir, "leaf_by_p224.pem", "CERTIFICATE", leaf224);
     let bk = x509::generate_key(x509::KEY_EC_P256);
     var bt, okbt = x509::template("CN=x.bad.example.com", now - 3600, now + year);
     bt.key_usage = x509::KU_DIGITAL_SIGNATURE;
