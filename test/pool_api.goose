@@ -106,6 +106,20 @@ fn main() {
     check("pinned leaf", x509::pool_add(pinned, cert_der("leaf_ec")) &&
           x509::verify_pools(cert_der("leaf_ec"), inters, pinned, "", NOW, "example.com", opts) == x509::OK);
 
+    // Extended key usage: client certificates, and any usage.
+    check("client certificate", x509::verify_client_with_roots(cert_der("leaf_client"), cert_der("int_ec"), d, NOW) ==
+                                x509::OK);
+    check("server certificate as a client's", x509::verify_client_with_roots(cert_der("leaf_ec"), cert_der("int_ec"), d,
+                                                                             NOW) == x509::ERR_EXTENDED_KEY_USAGE);
+    check("client certificate as a server's", x509::verify_with_roots(cert_der("leaf_client"), cert_der("int_ec"), d, NOW,
+                                                                      "") == x509::ERR_EXTENDED_KEY_USAGE);
+    var any = x509::options();
+    any.key_usages = x509::EKU_ANY;
+    check("any usage", x509::verify_pools(cert_der("leaf_client"), inters, d, "", NOW, "", any) == x509::OK);
+    var both = x509::options();
+    both.key_usages = x509::EKU_SERVER_AUTH | x509::EKU_CLIENT_AUTH;
+    check("either usage", x509::verify_pools(cert_der("leaf_client"), inters, d, "", NOW, "", both) == x509::OK);
+
     // The system's roots: loaded once, a copy each time.
     let sys, oks = x509::system_roots();
     check("system roots", oks && x509::pool_len(sys) > 0);

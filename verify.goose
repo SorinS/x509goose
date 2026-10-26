@@ -1,5 +1,5 @@
-// x509.verify: certification path validation for TLS servers (RFC 5280
-// §6, as a server's chain needs it): path building over pools of
+// x509.verify: certification path validation for TLS servers and clients
+// (RFC 5280 §6, as their chains need it): path building over pools of
 // intermediates and roots, then the checks that need the whole path (name
 // constraints, policies, revocation).
 
@@ -21,17 +21,25 @@ fn check_common(c: const Cert&, now: i64) -> i64 {
     return OK;
 }
 
+// Whether a certificate's extended key usage, if it has one, allows one of
+// the usages wanted (EKU_* masks).
+fn eku_allows(c: const Cert&, wanted: u32) -> bool {
+    if wanted & EKU_ANY != 0 || !c.has_ext_key_usage { return true; }
+    return c.ext_key_usage & (wanted | EKU_ANY) != 0;
+}
+
 // Checks on a certificate that issues the one below it, `below` CA
-// certificates (not counting the leaf) further down the path.
-fn check_issuer(c: const Cert&, now: i64, below: i64) -> i64 {
+// certificates (not counting the leaf) further down the path, for the
+// extended key usages wanted.
+fn check_issuer(c: const Cert&, now: i64, below: i64, wanted: u32) -> i64 {
     let e = check_common(c, now);
     if e != OK { return e; }
     if !c.has_basic_constraints || !c.is_ca { return ERR_NOT_CA; }
     if c.path_len >= 0 && below > c.path_len { return ERR_PATH_LENGTH; }
     if c.has_key_usage && c.key_usage & KU_KEY_CERT_SIGN == 0 { return ERR_KEY_USAGE; }
-    // A CA restricted by extended key usage must allow server
-    // authentication (as Go, Chrome and Firefox require).
-    if c.has_ext_key_usage && c.ext_key_usage & (EKU_SERVER_AUTH | EKU_ANY) == 0 { return ERR_EXTENDED_KEY_USAGE; }
+    // A CA restricted by extended key usage must allow the usage wanted (as
+    // Go, Chrome and Firefox require).
+    if !eku_allows(c, wanted) { return ERR_EXTENDED_KEY_USAGE; }
     return OK;
 }
 
@@ -125,10 +133,29 @@ fn verify_with_system_roots(leaf_der: const u8[:], intermediates: const u8[:], n
     return e, SYSTEM_ROOTS_OK;
 }
 
+// Validates a TLS client certificate against a pool of roots: as
+// verify_with_roots, for client authentication and without a host name.
+fn verify_client_with_roots(leaf_der: const u8[:], intermediates: const u8[:], roots: const CertPool&,
+                            now: i64) -> i64 {
+    let inters, oki = pool_of(intermediates);
+    if !oki { return ERR_MALFORMED; }
+    var opts = options();
+    opts.key_usages = EKU_CLIENT_AUTH;
+    return verify_pools(leaf_der, inters, roots, "", now, "", opts);
+}
+
+// The same against the system's roots; false in `found` if there are none.
+fn verify_client_with_system_roots(leaf_der: const u8[:], intermediates: const u8[:], now: i64) -> i64, bool {
+    load_system_roots_once();
+    let e = verify_client_with_roots(leaf_der, intermediates, SYSTEM_ROOTS, now);
+    return e, SYSTEM_ROOTS_OK;
+}
+
 // Validates a TLS server certificate (Go's Certificate.Verify): a path from
 // `leaf` through any of `intermediates` to one of `roots`, every link
 // signed by the next, all of them valid at `now` (seconds since 1970), the
-// CAs allowed to issue, the leaf allowed for server authentication and
+// CAs allowed to issue, the leaf and CAs allowed for the options' extended
+// key usages (server authentication by default), the leaf
 // valid for `host` (no check when host is empty), every name within the
 // name constraints above it, an acceptable policy when the path or the
 // options require one, and, when the options ask, a usable CRL among
@@ -143,7 +170,7 @@ fn verify_pools(leaf_der: const u8[:], intermediates: const CertPool&, roots: co
     if e != OK { return e; }
     let le = check_common(leaf, now);
     if le != OK { return le; }
-    if leaf.has_ext_key_usage && leaf.ext_key_usage & (EKU_SERVER_AUTH | EKU_ANY) == 0 { return ERR_EXTENDED_KEY_USAGE; }
+    if !eku_allows(leaf, opts.key_usages) { return ERR_EXTENDED_KEY_USAGE; }
     if leaf.has_key_usage && leaf.key_usage & (KU_DIGITAL_SIGNATURE | KU_KEY_ENCIPHERMENT | KU_KEY_AGREEMENT) == 0 {
         return ERR_KEY_USAGE;
     }
@@ -166,7 +193,7 @@ fn verify_pools(leaf_der: const u8[:], intermediates: const CertPool&, roots: co
         if tried[depth] == 0 {
             for ri in pool_issuers(roots, top) {
                 let root = pool_cert(roots, ri);
-                let ce = check_issuer(root, now, depth);
+                let ce = check_issuer(root, now, depth, opts.key_usages);
                 // A root without basicConstraints is accepted if it is
                 // self-issued (a v1 root); otherwise roots are held to the
                 // same rules as any CA.
@@ -198,7 +225,7 @@ fn verify_pools(leaf_der: const u8[:], intermediates: const CertPool&, roots: co
                 for p in path { if p == here { on_path = true; } }
                 if on_path { continue; }
                 let cand = pool_cert(intermediates, here);
-                let ce = check_issuer(cand, now, depth);
+                let ce = check_issuer(cand, now, depth, opts.key_usages);
                 if ce != OK { best = ce; continue; }
                 let se = check_signature(top, cand);
                 if se != OK { best = se; continue; }

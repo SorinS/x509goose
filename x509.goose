@@ -928,15 +928,18 @@ let CRL_LEAF: i64 = 1;
 let CRL_ALL: i64 = 2;
 
 // The inputs of path validation beyond the certificates and the time: CRL
-// checking, and RFC 5280's policy inputs, with the acceptable policies as
-// dotted OIDs separated by spaces (empty for any policy).
+// checking, the extended key usages the leaf is for (Go's KeyUsages, as
+// EKU_* masks: any one of them will do; EKU_ANY for any usage; server
+// authentication by default), and RFC 5280's policy inputs, with the
+// acceptable policies as dotted OIDs separated by spaces (empty for any
+// policy).
 struct Options {
-    crl_check: i64,
+    crl_check: i64, key_usages: u32,
     require_explicit_policy: bool, inhibit_policy_mapping: bool, inhibit_any_policy: bool,
     policies: u8[>..],
 }
 
 fn options() -> Options {
-    Options { crl_check: CRL_NONE, require_explicit_policy: false, inhibit_policy_mapping: false,
+    Options { crl_check: CRL_NONE, key_usages: EKU_SERVER_AUTH, require_explicit_policy: false, inhibit_policy_mapping: false,
               inhibit_any_policy: false, policies: [] }
 }

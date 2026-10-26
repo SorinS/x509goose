@@ -9,7 +9,7 @@ CertificateVerify signatures.
 | Module | Holds |
 |---|---|
 | `x509` | `Cert`, parsing, names, SANs, host matching, signatures, `Options` |
-| `x509.verify` | `verify_chain`, `verify_chain_with`, `verify_pools`, `verify_with_roots`, `verify_with_system_roots` |
+| `x509.verify` | `verify_chain`, `verify_chain_with`, `verify_pools`, `verify_with_roots`, `verify_with_system_roots`, `verify_client_with_roots`, `verify_client_with_system_roots` |
 | `x509.pool` | `CertPool`: certificates by subject and key identifier; loading from PEM, DER, files, directories and the system's root store |
 | `x509.constraints` | name constraints |
 | `x509.policy` | certificate policy processing |
@@ -105,7 +105,9 @@ have basicConstraints CA (a self-issued v1 root without basicConstraints
 is accepted) and respect their path lengths. A CA that has key usage must
 allow keyCertSign, and one that has extended key usage must allow
 serverAuth. The leaf's own extended key usage, if present, must allow
-serverAuth, and its key usage must allow a TLS key. `host`, if not empty,
+serverAuth, and its key usage must allow a TLS key. `Options.key_usages`
+(Go's KeyUsages, as `EKU_*` masks) changes the usage required of the leaf
+and the CAs: any one of those given will do, and `EKU_ANY` accepts any. `host`, if not empty,
 must match the leaf. A leaf that is itself one of the roots is accepted
 as pinned.
 
@@ -119,7 +121,10 @@ The same search runs over pools (see below):
 - `verify_with_roots(leaf, intermediates, roots_pool, now, host)` takes
   the intermediates as concatenated DER;
 - `verify_with_system_roots(leaf, intermediates, now, host)` uses the
-  system's roots, loaded once.
+  system's roots, loaded once;
+- `verify_client_with_roots(leaf, intermediates, roots_pool, now)` and
+  `verify_client_with_system_roots(leaf, intermediates, now)` check a TLS
+  client certificate: clientAuth instead of serverAuth, and no host.
 
 `verify_chain` and `verify_chain_with` build pools from their
 concatenations. Candidate issuers are looked up by subject. Those whose
