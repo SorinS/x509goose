@@ -9,7 +9,8 @@ CertificateVerify signatures.
 | Module | Holds |
 |---|---|
 | `x509` | `Cert`, parsing, names, SANs, host matching, signatures, `Options` |
-| `x509.verify` | `verify_chain`, `verify_chain_with` |
+| `x509.verify` | `verify_chain`, `verify_chain_with`, `verify_pools`, `verify_with_roots`, `verify_with_system_roots` |
+| `x509.pool` | `CertPool`: certificates by subject and key identifier; loading from PEM, DER, files, directories and the system's root store |
 | `x509.constraints` | name constraints |
 | `x509.policy` | certificate policy processing |
 | `x509.crl` | `Crl`, `parse_crl`, `check_crl`, `crl_lookup`, `revocation_status` |
@@ -112,6 +113,19 @@ as pinned.
 adds three checks on top of `verify_chain`, run on each complete path it
 builds. If they fail, it keeps searching for another path.
 
+The same search runs over pools (see below):
+- `verify_pools(leaf, intermediates_pool, roots_pool, crls, now, host, opts)`
+  is the general form;
+- `verify_with_roots(leaf, intermediates, roots_pool, now, host)` takes
+  the intermediates as concatenated DER;
+- `verify_with_system_roots(leaf, intermediates, now, host)` uses the
+  system's roots, loaded once.
+
+`verify_chain` and `verify_chain_with` build pools from their
+concatenations. Candidate issuers are looked up by subject. Those whose
+subject key identifier matches the authority key identifier are tried
+first, so two roots of one name both work.
+
 - **Name constraints** (RFC 5280 §4.2.1.10). Every CA's permitted and
   excluded subtrees, the root's included, bind every certificate below it
   except self-issued intermediates.
@@ -144,6 +158,41 @@ builds. If they fail, it keeps searching for another path.
   no usable CRL is `ERR_REVOCATION_UNKNOWN`. Delta CRLs, indirect CRLs and
   CRLs partitioned by reason parse but are never used. `crl_urls(c)`
   lists a certificate's distribution points. OCSP is in `x509.ocsp`.
+
+## Pools and the system's roots
+
+`CertPool` corresponds to Go's `x509.CertPool`. It holds each
+certificate once (up to 4,096), indexed by subject and key identifier.
+
+| Go | Here |
+|---|---|
+| `NewCertPool` | `new_pool()` |
+| `AddCert` | `pool_add(p, der)`, `pool_add_cert(p, cert)`, `pool_add_concatenated(p, list)` |
+| `AppendCertsFromPEM` | `pool_append_pem(p, text)` (how many were new; blocks that do not parse are skipped) |
+| `SystemCertPool` | `system_roots()` (loaded once; a copy each call), `load_system_roots()` (loaded afresh) |
+| `Contains`, `len(Subjects())` | `pool_contains(p, der)`, `pool_len(p)` |
+| | `pool_add_file(p, path)`, `pool_add_dir(p, dir)`, `pool_der`, `pool_cert`, `pool_issuers`, `pool_concatenated` |
+
+`pool_add_file` reads a PEM file (any number of certificates) or a single
+DER certificate. `pool_add_dir` reads every file of a directory, but not
+its subdirectories, as openssl's and Go's certificate directories hold
+them:
+- hashed `c_rehash` names or any other names;
+- files that hold no certificate are skipped;
+- a certificate reached under two names is added once.
+
+Both return how many certificates were new, or -1 if the path cannot be
+read.
+
+The system's roots are found as Go finds them on Unix:
+- the file `$SSL_CERT_FILE`, else the first readable bundle of the
+  Linux and BSD locations, the last of which, `/etc/ssl/cert.pem`, is
+  macOS's;
+- then every directory of `$SSL_CERT_DIR` (separated by `:`), else
+  `/etc/ssl/certs`, `/etc/pki/tls/certs`, `/usr/local/share/certs` and
+  `/etc/openssl/certs`.
+
+The Windows certificate store is not read.
 
 ## Keys
 
@@ -283,6 +332,17 @@ python3 scripts/gen_vectors.py          # regenerate the vectors with openssl
   ML-DSA-44, ML-DSA-87 and DSA leaves, a DSA root's leaf, and an ML-DSA
   CSR and CRL, all made here. Go's crypto/x509 verifies the ML-DSA ones
   and reads their keys.
+- `pool_api`: adding certificates once, from DER, PEM, files, and
+  `vectors/rootdir` (`scripts/make_rootdir.py`). The directory holds PEM
+  and DER files, a c_rehash link, junk, a text file and a subdirectory
+  that must be left alone. Also checked:
+  - issuer lookup, key identifier first;
+  - paths over pools, with two roots of one name;
+  - the system's roots, loaded once and copied out.
+
+  `scripts/check_roots.py` checks system root loading against Go's rules,
+  with the environment as it is, with `SSL_CERT_FILE` and `SSL_CERT_DIR`
+  set, and with nothing to find.
 - `ocsp_vectors`: requests and responses made by Go's x/crypto/ocsp
   (`scripts/govectors`): requests made here byte for byte and parsed back;
   good, revoked and unknown responses from the CA and from a delegated

@@ -1,6 +1,7 @@
 // x509.verify: certification path validation for TLS servers (RFC 5280
-// §6, as a server's chain needs it): path building, then the checks that
-// need the whole path (name constraints, policies, revocation).
+// §6, as a server's chain needs it): path building over pools of
+// intermediates and roots, then the checks that need the whole path (name
+// constraints, policies, revocation).
 
 namespace x509;
 
@@ -10,6 +11,7 @@ import asn1;
 import constraints;
 import policy;
 import crl;
+import pool;
 
 // Checks that apply to any certificate on a path: dates and extensions.
 fn check_common(c: const Cert&, now: i64) -> i64 {
@@ -91,19 +93,52 @@ fn verify_chain(leaf_der: const u8[:], intermediates: const u8[:], roots: const 
     return verify_chain_with(leaf_der, intermediates, roots, "", now, host, opts);
 }
 
-// Validates a TLS server certificate: a path from `leaf` through any of
-// `intermediates` to one of `roots` (each DER certificates concatenated),
-// every link signed by the next, all of them valid at `now` (seconds since
-// 1970), the CAs allowed to issue, the leaf allowed for server
-// authentication and valid for `host` (no check when host is empty), every
-// name within the name constraints above it, an acceptable policy when the
-// path or the options require one, and, when the options ask, a usable
-// CRL among `crls` (DER CRLs concatenated) that does not list the
-// certificates checked. The roots' own signatures and dates are not
-// checked, only their keys and constraints, as trust anchors are. Returns
-// OK or the error of the path that came closest.
+// Validates a TLS server certificate: see verify_pools, with the
+// intermediates and roots as DER certificates concatenated. A malformed
+// intermediate is ERR_MALFORMED; roots that do not parse are left out.
 fn verify_chain_with(leaf_der: const u8[:], intermediates: const u8[:], roots: const u8[:],
                      crls: const u8[:], now: i64, host: const u8[:], opts: const Options&) -> i64 {
+    let inters, oki = pool_of(intermediates);
+    if !oki { return ERR_MALFORMED; }
+    var rp = new_pool();
+    let okr = pool_add_concatenated(rp, roots);
+    return verify_pools(leaf_der, inters, rp, crls, now, host, opts);
+}
+
+// Validates a TLS server certificate with default options and no CRLs
+// against a pool of roots (the system's, say): see verify_pools.
+fn verify_with_roots(leaf_der: const u8[:], intermediates: const u8[:], roots: const CertPool&, now: i64,
+                     host: const u8[:]) -> i64 {
+    let inters, oki = pool_of(intermediates);
+    if !oki { return ERR_MALFORMED; }
+    let opts = options();
+    return verify_pools(leaf_der, inters, roots, "", now, host, opts);
+}
+
+// Validates a TLS server certificate with default options and no CRLs
+// against the system's roots (system_roots), loaded the first time; false
+// in `found` if there are none, when the result is ERR_UNKNOWN_ISSUER.
+fn verify_with_system_roots(leaf_der: const u8[:], intermediates: const u8[:], now: i64,
+                            host: const u8[:]) -> i64, bool {
+    load_system_roots_once();
+    let e = verify_with_roots(leaf_der, intermediates, SYSTEM_ROOTS, now, host);
+    return e, SYSTEM_ROOTS_OK;
+}
+
+// Validates a TLS server certificate (Go's Certificate.Verify): a path from
+// `leaf` through any of `intermediates` to one of `roots`, every link
+// signed by the next, all of them valid at `now` (seconds since 1970), the
+// CAs allowed to issue, the leaf allowed for server authentication and
+// valid for `host` (no check when host is empty), every name within the
+// name constraints above it, an acceptable policy when the path or the
+// options require one, and, when the options ask, a usable CRL among
+// `crls` (DER CRLs concatenated) that does not list the certificates
+// checked. The roots' own signatures and dates are not checked, only
+// their keys and constraints, as trust anchors are. Issuers are looked up
+// by name in the pools, those with the matching key identifier first.
+// Returns OK or the error of the path that came closest.
+fn verify_pools(leaf_der: const u8[:], intermediates: const CertPool&, roots: const CertPool&,
+                crls: const u8[:], now: i64, host: const u8[:], opts: const Options&) -> i64 {
     let leaf, e = parse(leaf_der);
     if e != OK { return e; }
     let le = check_common(leaf, now);
@@ -114,16 +149,10 @@ fn verify_chain_with(leaf_der: const u8[:], intermediates: const u8[:], roots: c
     }
     if host.len > 0 && !matches_host(leaf, host) { return ERR_HOSTNAME; }
     // The leaf itself trusted, as a pinned certificate.
-    var r = 0;
-    while r < roots.len {
-        let t, okr = asn1::read(roots, r, roots.len);
-        if !okr { break; }
-        if roots[t.start..t.end] == leaf_der { return OK; }
-        r = t.end;
-    }
-    // Depth-first search. path[i] is the offset in `intermediates` of the
-    // i-th certificate above the leaf; tried[i] is where the search for
-    // the next one up resumes.
+    if pool_contains(roots, leaf_der) { return OK; }
+    // Depth-first search. path[i] is the index in `intermediates` of the
+    // i-th certificate above the leaf; tried[i] is how many of the
+    // candidates for the next one up have been tried.
     var path: i64[>..<] = [];
     var tried: i64[>..<] = [0];
     var best = ERR_UNKNOWN_ISSUER;
@@ -131,61 +160,54 @@ fn verify_chain_with(leaf_der: const u8[:], intermediates: const u8[:], roots: c
         let depth = path.len;
         // The certificate at the top of the path so far.
         var top = empty_cert();
-        if depth == 0 {
-            top = copy(leaf);
-        } else {
-            let c, n = cert_at(intermediates, path[depth - 1]);
-            top = copy(c);
-        }
-        // A root that issued it ends the search, if the whole path holds.
-        var ro = 0;
-        while ro < roots.len {
-            let root, next = cert_at(roots, ro);
-            if next < 0 { break; }
-            ro = next;
-            if !issued_by(top, root) { continue; }
-            let ce = check_issuer(root, now, depth);
-            // A root without basicConstraints is accepted if it is
-            // self-issued (a v1 root); otherwise roots are held to the
-            // same rules as any CA.
-            let ok_root = ce == OK || (ce == ERR_NOT_CA && !root.has_basic_constraints && self_issued(root));
-            if !ok_root { best = ce; continue; }
-            let se = check_signature(top, root);
-            if se != OK { best = se; continue; }
-            var chain: u8[>..] = [];
-            var k = depth;
-            while k > 0 {
-                k--;
-                let t, okc = asn1::read(intermediates, path[k], intermediates.len);
-                chain.append(intermediates[t.start..t.end]);
+        if depth == 0 { top = copy(leaf); } else { top = pool_cert(intermediates, path[depth - 1]); }
+        // A root that issued it ends the search, if the whole path holds;
+        // tried once per certificate on the path.
+        if tried[depth] == 0 {
+            for ri in pool_issuers(roots, top) {
+                let root = pool_cert(roots, ri);
+                let ce = check_issuer(root, now, depth);
+                // A root without basicConstraints is accepted if it is
+                // self-issued (a v1 root); otherwise roots are held to the
+                // same rules as any CA.
+                let ok_root = ce == OK || (ce == ERR_NOT_CA && !root.has_basic_constraints && self_issued(root));
+                if !ok_root { best = ce; continue; }
+                let se = check_signature(top, root);
+                if se != OK { best = se; continue; }
+                var chain: u8[>..] = [];
+                var k = depth;
+                while k > 0 {
+                    k--;
+                    chain.append(pool_der(intermediates, path[k]));
+                }
+                chain.append(leaf_der);
+                let pe = check_path(root, chain, depth + 1, crls, now, opts);
+                if pe == OK { return OK; }
+                best = pe;
             }
-            chain.append(leaf_der);
-            let pe = check_path(root, chain, depth + 1, crls, now, opts);
-            if pe == OK { return OK; }
-            best = pe;
         }
         // Otherwise an intermediate that issued it, not already on the path.
         var found = false;
         if depth < MAX_DEPTH {
-            var io = tried[depth];
-            while io < intermediates.len {
-                let cand, next = cert_at(intermediates, io);
-                if next < 0 { return ERR_MALFORMED; }
-                let here = io;
-                io = next;
+            let cands = pool_issuers(intermediates, top);
+            var ci = tried[depth];
+            while ci < cands.len {
+                let here = cands[ci];
+                ci++;
                 var on_path = false;
                 for p in path { if p == here { on_path = true; } }
-                if on_path || !issued_by(top, cand) { continue; }
+                if on_path { continue; }
+                let cand = pool_cert(intermediates, here);
                 let ce = check_issuer(cand, now, depth);
                 if ce != OK { best = ce; continue; }
                 let se = check_signature(top, cand);
                 if se != OK { best = se; continue; }
-                tried[depth] = io;
                 path.push(here);
                 tried.push(0);
                 found = true;
                 break;
             }
+            tried[depth] = ::max(ci, 1);
         } else {
             best = ERR_CHAIN_TOO_LONG;
         }
