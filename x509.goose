@@ -815,6 +815,31 @@ fn matches_host(c: const Cert&, host: const u8[:]) -> bool {
 
 // --- Signatures ---------------------------------------------------------------
 
+// An RSAPublicKey (the subjectPublicKey of an RSA key) as bignum's.
+fn rsa_key_of(kb: const u8[:]) -> bignum::RsaPublicKey, i64 {
+    let rk, okr = asn1::parse(kb);
+    let p, okp = asn1::children_of(kb, rk, asn1::SEQUENCE);
+    let none = bignum::RsaPublicKey { n: [], e: [] };
+    if !okr || !okp || p.len != 2 { return none, ERR_MALFORMED; }
+    let n, okn = asn1::read_uint(kb, p[0]);
+    let e, oke = asn1::read_uint(kb, p[1]);
+    if !okn || !oke { return none, ERR_MALFORMED; }
+    let pub, okpub = bignum::rsa_public_from(bignum::from_bytes_be(n), bignum::from_bytes_be(e));
+    if !okpub { return none, ERR_UNSUPPORTED_ALGORITHM; }
+    return pub, OK;
+}
+
+// The RSA public key of a certificate (for TLS 1.2's RSA key exchange,
+// say); false when the key is not RSA or not usable.
+fn rsa_public_key(c: const Cert&) -> bignum::RsaPublicKey, bool {
+    let d = c.der[..];
+    let kb, okk = key_bytes(d, c.key);
+    let none = bignum::RsaPublicKey { n: [], e: [] };
+    if !okk || c.key_type != KEY_RSA { return none, false; }
+    let pub, e = rsa_key_of(kb);
+    return pub, e == OK;
+}
+
 // Verifies sig over msg with the key of `key_cert`, by algorithm alg with
 // hash h (and PSS salt length).
 fn verify_with(key_cert: const Cert&, alg: i64, h: i64, salt: i64, msg: const u8[:], sig: const u8[:]) -> i64 {
@@ -823,14 +848,8 @@ fn verify_with(key_cert: const Cert&, alg: i64, h: i64, salt: i64, msg: const u8
     if !okk { return ERR_MALFORMED; }
     if alg == SIG_RSA_PKCS1 || alg == SIG_RSA_PSS {
         if key_cert.key_type != KEY_RSA { return ERR_BAD_SIGNATURE; }
-        let rk, okr = asn1::parse(kb);
-        let p, okp = asn1::children_of(kb, rk, asn1::SEQUENCE);
-        if !okr || !okp || p.len != 2 { return ERR_MALFORMED; }
-        let n, okn = asn1::read_uint(kb, p[0]);
-        let e, oke = asn1::read_uint(kb, p[1]);
-        if !okn || !oke { return ERR_MALFORMED; }
-        let pub, okpub = bignum::rsa_public_from(bignum::from_bytes_be(n), bignum::from_bytes_be(e));
-        if !okpub { return ERR_UNSUPPORTED_ALGORITHM; }
+        let pub, e = rsa_key_of(kb);
+        if e != OK { return e; }
         let good = if alg == SIG_RSA_PKCS1 { bignum::rsa_verify_pkcs1(pub, msg, sig, h) }
                    else { bignum::rsa_verify_pss(pub, msg, sig, salt, h) };
         return if good { OK } else { ERR_BAD_SIGNATURE };
