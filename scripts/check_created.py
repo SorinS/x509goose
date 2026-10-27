@@ -8,7 +8,7 @@ refuse the leaf outside the intermediate's name constraints, verify the
 CSR's signature and both CRLs, find the revoked leaf revoked under
 -crl_check_all and the others not, and read every private key, whose
 public key must be the one in its certificate; the same for the ML-DSA
-and DSA hierarchy. Go's crypto/x509 (scripts/govectors `check`) must
+and DSA hierarchy. Go's crypto/x509 (tools/govectors `check`) must
 verify the ML-DSA leaves and read their PKCS #8 keys.
 
     python3 scripts/check_created.py [--goose PATH]
@@ -86,8 +86,7 @@ def main():
     expect("ML-DSA csr signature", ossl("req", "-in", f("csr_mldsa.pem"), "-verify", "-noout"), True, "verify OK")
     expect("ML-DSA crl", ossl("crl", "-in", f("crl_pq.pem"), "-CAfile", f("pq_root.pem"), "-noout"), True, "verify OK")
     # Go's crypto/x509 too, for the ML-DSA certificates (it checks no DSA signatures).
-    go = subprocess.run(["go", "run", ".", "check", d], cwd=os.path.join(ROOT, "scripts", "govectors"),
-                        env={**os.environ, "GOFLAGS": "-mod=mod", "GOPROXY": "off"}, capture_output=True, text=True)
+    go = subprocess.run([os.path.join(ROOT, "tools", "govectors.sh"), "check", d], capture_output=True, text=True)
     expect("Go verifies the ML-DSA leaves and reads their keys", go, True, "ok")
     expect("text dump", ossl("x509", "-in", f("int.pem"), "-noout", "-text"), True, "Permitted:")
     shutil.rmtree(d)

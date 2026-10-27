@@ -297,9 +297,22 @@ refuses: openssl 3's default PBES2 (PBKDF2 and AES-CBC), 2-key 3DES,
 ## Tests
 
 ```bash
-python3 scripts/run_tests.py [--native]
+python3 scripts/run_tests.py [--native] # at -O0, -O2 and --debug (and natively)
+python3 scripts/check_created.py        # x509.create's output against openssl and Go
+python3 scripts/check_roots.py          # system roots against Go's rules
 python3 scripts/gen_vectors.py          # regenerate the vectors with openssl
+python3 scripts/pq_vectors.py           # remake vectors/pq.txt (openssl, Go)
+python3 scripts/pkcs12_vectors.py       # remake the PKCS #12 vectors (openssl)
+python3 scripts/make_rootdir.py         # remake vectors/rootdir
+tools/govectors.sh > test/vectors/ocsp.txt   # remake the OCSP vectors (Go)
 ```
+
+They take the compiler from `--goose`, `$GOOSE`, `goose` on PATH or
+`../goose.git/build/goose`, and asn1goose.git and bigmongoose.git beside
+this repository; the vector scripts need openssl 3.5 or later, and the Go
+ones Go with golang.org/x/crypto v0.55.0 in the module cache (they run
+offline). `tools/govectors.sh` builds `tools/govectors` and runs it with
+its arguments.
 
 - `cert_vectors`: a PKI made by openssl, with every supported signature
   algorithm and one certificate for each way a path fails. Each
@@ -349,7 +362,7 @@ python3 scripts/gen_vectors.py          # regenerate the vectors with openssl
   with the environment as it is, with `SSL_CERT_FILE` and `SSL_CERT_DIR`
   set, and with nothing to find.
 - `ocsp_vectors`: requests and responses made by Go's x/crypto/ocsp
-  (`scripts/govectors`): requests made here byte for byte and parsed back;
+  (`tools/govectors`): requests made here byte for byte and parsed back;
   good, revoked and unknown responses from the CA and from a delegated
   responder, parsed and checked (and refused for a responder without
   id-kp-OCSPSigning, another CA, the wrong certificate, too early or too

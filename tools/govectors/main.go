@@ -6,7 +6,7 @@
 // keys from fixed seeds; producedAt is the minute Go ran, read back from
 // each response.
 //
-//	cd scripts/govectors && GOFLAGS=-mod=mod GOPROXY=off go run . > ../../test/vectors/ocsp.txt
+//	tools/govectors.sh > test/vectors/ocsp.txt
 //
 // With the argument `pq` it prints instead the Go part of pq.txt (see
 // pq.go and scripts/pq_vectors.py); with `check <dir>` it checks what

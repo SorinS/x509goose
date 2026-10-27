@@ -7,7 +7,7 @@ SubjectPublicKeyInfo; DSA keys of each (L, N) in PKCS #8 and openssl's
 "DSA PRIVATE KEY", with theirs; and two hierarchies, an ML-DSA one
 (ML-DSA-87 root, ML-DSA-65 intermediate, leaves on ML-DSA-44 and P-256
 keys) and a DSA one (signed with SHA-256 and SHA-224), whose path cases
-openssl verify must agree with. From Go (scripts/govectors, `pq`): an
+openssl verify must agree with. From Go (tools/govectors, `pq`): an
 ML-DSA hierarchy made by crypto/x509 and Go's PKCS #8 for fixed seeds.
 
     mlkey <set> <seed-only> <seed+expanded> <expanded-only> <spki>
@@ -118,9 +118,7 @@ def main():
         case("dsa_sha224", "dsa_leaf224", [], ["dsa_root"], "example.com", "ok")
         lines += cases
 
-    go = subprocess.run(["go", "run", ".", "pq"], cwd=os.path.join(ROOT, "scripts", "govectors"),
-                        env={**os.environ, "GOFLAGS": "-mod=mod", "GOPROXY": "off"},
-                        capture_output=True, text=True)
+    go = subprocess.run([os.path.join(ROOT, "tools", "govectors.sh"), "pq"], capture_output=True, text=True)
     if go.returncode != 0:
         raise RuntimeError(go.stderr)
     lines += go.stdout.splitlines()

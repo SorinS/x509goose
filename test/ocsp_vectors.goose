@@ -1,4 +1,4 @@
-// vectors/ocsp.txt, from Go's x/crypto/ocsp (scripts/govectors): requests
+// vectors/ocsp.txt, from Go's x/crypto/ocsp (tools/govectors): requests
 // for SHA-1, -256, -384 and -512 CertIDs, made here byte for byte and
 // parsed back; responses (good, revoked with and without a reason,
 // unknown; signed by the CA, by a delegated responder carrying its
