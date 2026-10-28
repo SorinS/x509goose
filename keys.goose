@@ -80,8 +80,7 @@ fn parse_rsa_private(k: PrivateKey&, d: const u8[:], t: asn1::Tlv) -> bool {
     let p, ok4 = asn1::read_uint(d, f[4]);
     let q, ok5 = asn1::read_uint(d, f[5]);
     if !ok1 || !ok2 || !ok3 || !ok4 || !ok5 { return false; }
-    let rk, okk = bignum::rsa_key_from(bignum::from_bytes_be(n), bignum::from_bytes_be(e), bignum::from_bytes_be(dd),
-                                       bignum::from_bytes_be(p), bignum::from_bytes_be(q));
+    let rk, okk = bignum::rsa_key_from_bytes(n, e, dd, p, q);    // in constant time
     if !okk { return false; }
     k.rsa = rk;
     k.kind = KEY_RSA;
