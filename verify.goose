@@ -54,6 +54,20 @@ fn cert_at(list: const u8[:], off: i64) -> Cert, i64 {
 
 let MAX_DEPTH: i64 = 8;
 
+// Signature checks one path search may make, as Go's
+// maxChainSignatureChecks: certificates sent to be verified must not
+// buy unbounded work.
+let MAX_SIGNATURE_CHECKS: i64 = 100;
+
+// Whether two certificates are one as far as a path goes: subject, key
+// and subjectAltName (Go's alreadyInChain). Coming back to either only
+// makes a loop, or the permutations of copies of one CA.
+fn same_identity(a: const Cert&, b: const Cert&) -> bool {
+    a.der[a.subject.start..a.subject.end] == b.der[b.subject.start..b.subject.end]
+        && a.der[a.spki.start..a.spki.end] == b.der[b.spki.start..b.spki.end]
+        && a.has_san == b.has_san && a.der[a.san.start..a.san.end] == b.der[b.san.start..b.san.end]
+}
+
 // The checks that need the whole path, given top-down as `chain` (n
 // certificates, the leaf last) under `root`: name constraints, policies,
 // and revocation as the options ask.
@@ -183,6 +197,7 @@ fn verify_pools(leaf_der: const u8[:], intermediates: const CertPool&, roots: co
     var path: i64[>..<] = [];
     var tried: i64[>..<] = [0];
     var best = ERR_UNKNOWN_ISSUER;
+    var sigs = 0;
     loop {
         let depth = path.len;
         // The certificate at the top of the path so far.
@@ -199,6 +214,8 @@ fn verify_pools(leaf_der: const u8[:], intermediates: const CertPool&, roots: co
                 // same rules as any CA.
                 let ok_root = ce == OK || (ce == ERR_NOT_CA && !root.has_basic_constraints && self_issued(root));
                 if !ok_root { best = ce; continue; }
+                if sigs == MAX_SIGNATURE_CHECKS { return ERR_TOO_MANY_SIGNATURES; }
+                sigs++;
                 let se = check_signature(top, root);
                 if se != OK { best = se; continue; }
                 var chain: u8[>..] = [];
@@ -221,12 +238,19 @@ fn verify_pools(leaf_der: const u8[:], intermediates: const CertPool&, roots: co
             while ci < cands.len {
                 let here = cands[ci];
                 ci++;
-                var on_path = false;
-                for p in path { if p == here { on_path = true; } }
-                if on_path { continue; }
                 let cand = pool_cert(intermediates, here);
+                var on_path = same_identity(cand, leaf);
+                for p in path {
+                    if on_path { break; }
+                    if p == here { on_path = true; continue; }
+                    let pc = pool_cert(intermediates, p);
+                    on_path = same_identity(cand, pc);
+                }
+                if on_path { continue; }
                 let ce = check_issuer(cand, now, depth, opts.key_usages);
                 if ce != OK { best = ce; continue; }
+                if sigs == MAX_SIGNATURE_CHECKS { return ERR_TOO_MANY_SIGNATURES; }
+                sigs++;
                 let se = check_signature(top, cand);
                 if se != OK { best = se; continue; }
                 path.push(here);

@@ -48,6 +48,66 @@ fn key_line(kind: const u8[:], idx: i64) -> u8[>..] {
 let NOW: i64 = 1800000000;
 let YEAR: i64 = 31536000;
 
+// A CA certificate, self-issued, under `key` (its own, or another's for a
+// signature that does not verify).
+fn ca_cert(name: const u8[:], serial: i64, key: const x509::PrivateKey&) -> u8[>..] {
+    var t, ok = x509::template(name, NOW - YEAR, NOW + YEAR);
+    t.is_ca = true;
+    t.key_usage = x509::KU_KEY_CERT_SIGN;
+    t.serial.push((serial >> 8) as! u8);
+    t.serial.push(serial as! u8);
+    let c, e = x509::create_certificate(t, x509::marshal_public_key(key), "", key);
+    assert(ok && e == x509::OK);
+    return c;
+}
+
+fn leaf_under(ca: const u8[:], ca_key: const x509::PrivateKey&) -> u8[>..] {
+    let lk = x509::generate_key(x509::KEY_ED25519);
+    var lt, ok = x509::template("CN=www.example.com", NOW - 10, NOW + YEAR);
+    lt.key_usage = x509::KU_DIGITAL_SIGNATURE;
+    x509::add_dns(lt.san, "www.example.com");
+    let leaf, e = x509::create_certificate(lt, x509::marshal_public_key(lk), ca, ca_key);
+    assert(ok && e == x509::OK);
+    return leaf;
+}
+
+// Intermediates sent with a certificate must not buy unbounded work.
+fn path_search_bounded(root: const u8[:]) {
+    // Copies of one CA, same subject and key, serials apart: each verifies
+    // every other, and none leads to a root. Without telling them apart the
+    // search walks their permutations, 12!/4! paths.
+    let ck = x509::generate_key(x509::KEY_ED25519);
+    let first = ca_cert("CN=Goose Copied CA", 1, ck);
+    var copies: u8[>..] = [];
+    copies.append(first);
+    for i in 11 { copies.append(ca_cert("CN=Goose Copied CA", i + 2, ck)); }
+    let leaf = leaf_under(first, ck);
+    check("copies of one CA: unknown issuer", x509::verify_chain(leaf, copies, root, NOW, "") == x509::ERR_UNKNOWN_ISSUER);
+    // 120 CAs of the leaf's issuer name, none its signer: the search gives
+    // up after Go's 100 signature checks.
+    let signer = x509::generate_key(x509::KEY_ED25519);
+    let lone = ca_cert("CN=Goose Busy CA", 1, signer);
+    var many: u8[>..] = [];
+    for i in 120 {
+        let k = x509::generate_key(x509::KEY_ED25519);
+        many.append(ca_cert("CN=Goose Busy CA", i + 2, k));
+    }
+    let busy = leaf_under(lone, signer);
+    check("120 candidates: signature checks capped",
+          x509::verify_chain(busy, many, root, NOW, "") == x509::ERR_TOO_MANY_SIGNATURES);
+    // Under the cap a real issuer is still found among decoys.
+    var some: u8[>..] = [];
+    for i in 20 {
+        let k = x509::generate_key(x509::KEY_ED25519);
+        some.append(ca_cert("CN=Goose Busy CA", i + 200, k));
+    }
+    some.append(lone);
+    var roots: u8[>..] = [];
+    roots.append(root);
+    roots.append(lone);
+    check("decoys, then the issuer", x509::verify_chain(busy, some, roots, NOW, "") == x509::OK);
+}
+
 fn main() {
     // Keys: parse and marshal against openssl's bytes.
     for kind in ["rsa", "p256", "p384", "p521", "ed25519", "p224"] {
@@ -230,6 +290,8 @@ fn main() {
     holder.der.append(n1);
     let t1, okt = asn1::parse(holder.der);
     check("multi-valued rdn", x509::name_text(holder.der, t1) == "CN=a+OU=b,O=c");
+
+    path_search_bounded(root);
 
     print("keys and creation: ", checks, " checks, ", failures, " failed");
     assert(failures == 0);

@@ -39,6 +39,7 @@ let ERR_POLICY: i64 = 15;
 let ERR_REVOKED: i64 = 16;
 let ERR_REVOCATION_UNKNOWN: i64 = 17;
 let ERR_SIGNING: i64 = 18;
+let ERR_TOO_MANY_SIGNATURES: i64 = 19;
 
 fn error_text(e: i64) -> const u8[:] {
     if e == OK { return "ok"; }
@@ -60,6 +61,7 @@ fn error_text(e: i64) -> const u8[:] {
     if e == ERR_REVOKED { return "revoked"; }
     if e == ERR_REVOCATION_UNKNOWN { return "revocation status unknown"; }
     if e == ERR_SIGNING { return "signing failed"; }
+    if e == ERR_TOO_MANY_SIGNATURES { return "too many signature checks building the chain"; }
     return "unknown error";
 }
 

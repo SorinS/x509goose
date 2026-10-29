@@ -98,7 +98,10 @@ ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, ecdsa_secp521r1_sha512
 `verify_chain(leaf, intermediates, roots, now, host)` searches depth-first
 for a path from the leaf through the intermediates to a root, and
 backtracks past dead ends. If no path works, it returns the error of the
-one that came closest. Each link must be signed by the certificate above
+one that came closest. As in Go, a certificate with the subject, key and
+subjectAltName of one already on the path is not tried again, and one
+search makes at most 100 signature checks (`ERR_TOO_MANY_SIGNATURES`
+past that), so intermediates sent by a peer cannot buy unbounded work. Each link must be signed by the certificate above
 it, and every certificate on the path must be within its validity period
 at `now` with no unknown critical extension. The CAs, roots included, must
 have basicConstraints CA (a self-issued v1 root without basicConstraints
