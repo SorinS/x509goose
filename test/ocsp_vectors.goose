@@ -99,6 +99,17 @@ fn delegated_validity(ca: const x509::Cert&, now: i64) {
     check("responder not yet valid", delegated_result(ca, leaf, ry, ryk, now) == x509::ERR_NOT_YET_VALID);
     let ru, ruk = responder_cert(ca, ca_key, now - 86400, now + 86400, x509::KU_KEY_ENCIPHERMENT);
     check("responder without digitalSignature", delegated_result(ca, leaf, ru, ruk, now) == x509::ERR_KEY_USAGE);
+    // Signed by the CA itself, but naming another responder: refused.
+    var t = x509::ocsp_template(x509::OCSP_GOOD, leaf.der[leaf.serial.off..leaf.serial.end], now);
+    t.next_update = now + 86400;
+    let der, e = x509::ocsp_create_response(ca, rc, ca_key, t, now, false);
+    let r, er = x509::ocsp_parse_response(der);
+    check("issuer-signed, naming another", e == x509::OK && er == x509::OK &&
+          x509::ocsp_check_response(r, leaf, ca, now) == x509::ERR_UNKNOWN_ISSUER);
+    let der2, e2 = x509::ocsp_create_response(ca, ca, ca_key, t, now, false);
+    let r2, er2 = x509::ocsp_parse_response(der2);
+    check("issuer-signed, naming the issuer", e2 == x509::OK && er2 == x509::OK &&
+          x509::ocsp_check_response(r2, leaf, ca, now) == x509::OK);
 }
 
 fn main() {

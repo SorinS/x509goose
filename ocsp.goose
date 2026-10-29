@@ -320,7 +320,8 @@ fn ocsp_names(r: const OcspResponse&, c: const Cert&) -> bool {
 // signing, current (thisUpdate passed, nextUpdate if any not). A
 // delegated responder's certificate must itself be valid at `now`, with
 // no unknown critical extension, allow digitalSignature if it has
-// keyUsage, and be the one the ResponderID names (RFC 6960 §4.2.2.2).
+// keyUsage, and be the one the ResponderID names (RFC 6960 §4.2.2.2);
+// signed by the issuer, the ResponderID must name the issuer.
 // Then OK for good, ERR_REVOKED, or ERR_REVOCATION_UNKNOWN for unknown.
 fn ocsp_check_response(r: const OcspResponse&, c: const Cert&, issuer: const Cert&, now: i64 = 0) -> i64 {
     if r.response_status != OCSP_SUCCESS { return ERR_REVOCATION_UNKNOWN; }
@@ -330,6 +331,9 @@ fn ocsp_check_response(r: const OcspResponse&, c: const Cert&, issuer: const Cer
     }
     let t = if now == 0 { time() as i64 } else { now };
     let direct = ocsp_signed_by(r, issuer);
+    // Signed by the issuer, the ResponderID must name the issuer (RFC 6960
+    // §4.2.2.3): who signed is who the response says it is.
+    if direct == OK && !ocsp_names(r, issuer) { return ERR_UNKNOWN_ISSUER; }
     if direct != OK {
         let rc, e = ocsp_responder_cert(r);
         if e != OK { return direct; }

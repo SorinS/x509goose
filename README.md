@@ -378,7 +378,8 @@ its arguments.
   id-kp-OCSPSigning, another CA, the wrong certificate, too early or too
   late), then made here byte for byte; the error responses; delegated
   responders made here, refused expired, not yet valid, or with a
-  keyUsage that leaves out digitalSignature.
+  keyUsage that leaves out digitalSignature; a response the issuer signed
+  that names another responder.
 - `pkcs12_vectors`: 54 files from openssl (`scripts/pkcs12_vectors.py`):
   RSA and P-256 keys with their chains under nine schemes and three
   passwords, each decoding to openssl's key and certificates; wrong
