@@ -180,9 +180,9 @@ fn main() {
     let subj, oks = x509::name_der("CN=csr.example.com,O=Requester\\, Inc.,C=US");
     var san: u8[..4096] = [];
     x509::add_dns(san, "csr.example.com");
-    let csr = x509::create_csr(subj, san, ck);
+    let csr, ecsr = x509::create_csr(subj, san, ck);
     let cr, ecr = x509::parse_csr(csr);
-    check("csr", oks && ecr == x509::OK && x509::check_csr(cr) == x509::OK && cr.key_type == x509::KEY_EC_P256);
+    check("csr", oks && ecsr == x509::OK && ecr == x509::OK && x509::check_csr(cr) == x509::OK && cr.key_type == x509::KEY_EC_P256);
     var csr_names: u8[>..] = [];
     for n in x509::csr_dns_names(cr) { csr_names.append(n); }
     check("csr san", csr_names == "csr.example.com");

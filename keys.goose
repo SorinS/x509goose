@@ -427,20 +427,32 @@ fn sig_fits_key(kind: i64, alg: i64, h: i64) -> bool {
     return false;
 }
 
-// A signature over msg: PKCS #1 v1.5 or PSS (salt as long as the hash),
-// ECDSA or DSA as a DER SEQUENCE (RFC 6979 nonces), Ed25519, or ML-DSA
-// (hedged, with the empty context).
-fn sign(k: const PrivateKey&, alg: i64, h: i64, msg: const u8[:]) -> u8[>..] {
+// A signature over msg and true: PKCS #1 v1.5 or PSS (salt as long as the
+// hash), ECDSA or DSA as a DER SEQUENCE (RFC 6979 nonces), Ed25519, or
+// ML-DSA (hedged, with the empty context). Empty and false when RSA's
+// private operation fails its check (a fault), as Go's Sign returns an
+// error, or for an RSA key too small for the hash.
+fn sign(k: const PrivateKey&, alg: i64, h: i64, msg: const u8[:]) -> u8[>..], bool {
     assert(sig_fits_key(k.kind, alg, h));
     var out: u8[>..] = [];
-    if alg == SIG_RSA_PKCS1 { return bignum::rsa_sign_pkcs1(k.rsa, msg, h); }
-    if alg == SIG_RSA_PSS { return bignum::rsa_sign_pss(k.rsa, msg, -1, h); }
-    if alg == SIG_ED25519 { out.append(bignum::ed25519_sign(k.seed, msg)); return out; }
-    if alg == SIG_MLDSA { return bignum::mldsa_sign(h, k.seed, msg); }
-    if alg == SIG_DSA { return bignum::dsa_sig_to_der(bignum::dsa_sign_deterministic(k.dsa, bignum::hash_bits(h, msg), h)); }
-    let c = curve_of_key(k.kind);
-    // ecdsa_sign hashes with the curve's own hash; any other goes through
-    // the digest.
-    if h == c.hash { return bignum::ecdsa_sig_to_der(bignum::ecdsa_sign(c, k.ec_sk, msg)); }
-    return bignum::ecdsa_sig_to_der(bignum::ecdsa_sign_digest(c, k.ec_sk, bignum::hash_bits(h, msg), h));
+    if alg == SIG_RSA_PKCS1 || alg == SIG_RSA_PSS {
+        if alg == SIG_RSA_PKCS1 {
+            let s, ok = bignum::rsa_sign_pkcs1(k.rsa, msg, h);
+            return s, ok;
+        }
+        let s, ok = bignum::rsa_sign_pss(k.rsa, msg, -1, h);
+        return s, ok;
+    }
+    if alg == SIG_ED25519 { out.append(bignum::ed25519_sign(k.seed, msg)); }
+    else if alg == SIG_MLDSA { out.append(bignum::mldsa_sign(h, k.seed, msg)); }
+    else if alg == SIG_DSA {
+        out.append(bignum::dsa_sig_to_der(bignum::dsa_sign_deterministic(k.dsa, bignum::hash_bits(h, msg), h)));
+    } else {
+        let c = curve_of_key(k.kind);
+        // ecdsa_sign hashes with the curve's own hash; any other goes
+        // through the digest.
+        if h == c.hash { out.append(bignum::ecdsa_sig_to_der(bignum::ecdsa_sign(c, k.ec_sk, msg))); }
+        else { out.append(bignum::ecdsa_sig_to_der(bignum::ecdsa_sign_digest(c, k.ec_sk, bignum::hash_bits(h, msg), h))); }
+    }
+    return out, true;
 }

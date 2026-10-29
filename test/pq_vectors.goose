@@ -76,7 +76,8 @@ fn sign_checks(label: const u8[:], k: const x509::PrivateKey&, scheme: u16, wron
     check(str(label, " altered certificate refused"), eb != x509::OK || x509::check_signature(cb, c) == x509::ERR_BAD_SIGNATURE);
     let a, h = x509::default_sig(k.kind);
     let msg = "a CertificateVerify, as it were";
-    let sig = x509::sign(k, a, h, msg);
+    let sig, oksig = x509::sign(k, a, h, msg);
+    check(str(label, " signs"), oksig);
     if scheme != 0 {
         check(str(label, " scheme verifies"), x509::verify_scheme(c, scheme, msg, sig) == x509::OK);
         check(str(label, " other message refused"), x509::verify_scheme(c, scheme, "another", sig) != x509::OK);

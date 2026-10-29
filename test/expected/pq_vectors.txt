@@ -1,2 +1,2 @@
 13 certificates, 10 path cases
-pq keys and certificates: 139 checks, 0 failed
+pq keys and certificates: 149 checks, 0 failed

@@ -332,15 +332,18 @@ fn put_extensions(out: u8[>..]&, t: const Template&, spki: const u8[:], issuer_k
     return true;
 }
 
-// Signs a to-be-signed SEQUENCE: tbs, AlgorithmIdentifier, BIT STRING.
-fn signed(tbs: const u8[:], alg_id: const u8[:], key: const PrivateKey&, alg: i64, h: i64) -> u8[>..] {
+// Signs a to-be-signed SEQUENCE: tbs, AlgorithmIdentifier, BIT STRING;
+// empty and false when signing fails.
+fn signed(tbs: const u8[:], alg_id: const u8[:], key: const PrivateKey&, alg: i64, h: i64) -> u8[>..], bool {
+    var out: u8[>..] = [];
+    let sig, ok = sign(key, alg, h, tbs);
+    if !ok { return out, false; }
     var body: u8[>..] = [];
     body.append(tbs);
     body.append(alg_id);
-    asn1::put_bits(body, sign(key, alg, h, tbs));
-    var out: u8[>..] = [];
+    asn1::put_bits(body, sig);
     asn1::put(out, asn1::SEQUENCE, body);
-    return out;
+    return out, true;
 }
 
 fn pick_alg(t_alg: i64, t_hash: i64, key: const PrivateKey&) -> i64, i64 {
@@ -400,7 +403,8 @@ fn create_certificate(t: const Template&, spki: const u8[:], issuer_der: const u
     if !put_extensions(tbs, t, spki, issuer_kid) { return none, ERR_MALFORMED; }
     var tbs_seq: u8[>..] = [];
     asn1::put(tbs_seq, asn1::SEQUENCE, tbs);
-    var cert = signed(tbs_seq, alg_id, issuer_key, alg, h);
+    var cert, oks = signed(tbs_seq, alg_id, issuer_key, alg, h);
+    if !oks { return none, ERR_SIGNING; }
     // What was made must parse.
     let c, pe = parse(cert);
     if pe != OK { cert.clear(); }
@@ -418,7 +422,7 @@ struct Csr {
 
 // A request for subject (Name DER) and the SAN entries in `san` (a
 // GeneralNames builder's contents; empty for none), signed by key.
-fn create_csr(subject: const u8[:], san: const u8[:], key: const PrivateKey&) -> u8[>..] {
+fn create_csr(subject: const u8[:], san: const u8[:], key: const PrivateKey&) -> u8[>..], i64 {
     let alg, h = default_sig(key.kind);
     var info: u8[>..] = [];
     asn1::put_i64(info, 0);
@@ -441,7 +445,8 @@ fn create_csr(subject: const u8[:], san: const u8[:], key: const PrivateKey&) ->
     asn1::put(info, asn1::ctx(0, true), attrs);
     var info_seq: u8[>..] = [];
     asn1::put(info_seq, asn1::SEQUENCE, info);
-    return signed(info_seq, sig_alg_id(alg, h), key, alg, h);
+    let csr, ok = signed(info_seq, sig_alg_id(alg, h), key, alg, h);
+    return csr, if ok { OK } else { ERR_SIGNING };
 }
 
 fn parse_csr(der: const u8[:]) -> Csr, i64 {
@@ -571,5 +576,6 @@ fn create_crl(issuer_der: const u8[:], key: const PrivateKey&, entries: const Re
     asn1::put(tbs, asn1::ctx(0, true), extseq);
     var tbs_seq: u8[>..] = [];
     asn1::put(tbs_seq, asn1::SEQUENCE, tbs);
-    return signed(tbs_seq, alg_id, key, alg, h), OK;
+    let crl, ok = signed(tbs_seq, alg_id, key, alg, h);
+    return crl, if ok { OK } else { ERR_SIGNING };
 }

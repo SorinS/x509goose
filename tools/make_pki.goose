@@ -101,7 +101,9 @@ fn main() {
     let subj, oks = x509::name_der("CN=csr.example.com,O=Requester\\, Inc.,C=US");
     var san: u8[..4096] = [];
     x509::add_dns(san, "csr.example.com");
-    save(dir, "csr.pem", "CERTIFICATE REQUEST", x509::create_csr(subj, san, ck));
+    let csr, ecsr = x509::create_csr(subj, san, ck);
+    assert(ecsr == x509::OK);
+    save(dir, "csr.pem", "CERTIFICATE REQUEST", csr);
     var entries: x509::Revoked[>..] = [];
     entries.push(x509::Revoked { serial: revoked_serial, time: now - 600, reason: 1 });
     let crl, ec = x509::create_crl(inter, int_key, entries, now - 600, now + 86400, 2);
@@ -144,7 +146,9 @@ fn main() {
         save(dir, str(pq_names[i], ".key"), "PRIVATE KEY", x509::marshal_pkcs8(lk));
     }
     let pq_csr_key = x509::generate_key(x509::KEY_MLDSA44);
-    save(dir, "csr_mldsa.pem", "CERTIFICATE REQUEST", x509::create_csr(subj, san, pq_csr_key));
+    let csr_mldsa, ecsr_mldsa = x509::create_csr(subj, san, pq_csr_key);
+    assert(ecsr_mldsa == x509::OK);
+    save(dir, "csr_mldsa.pem", "CERTIFICATE REQUEST", csr_mldsa);
     let pq_crl, epc = x509::create_crl(pq_root, pq_key, empty, now - 600, now + 86400, 1);
     assert(epc == x509::OK);
     save(dir, "crl_pq.pem", "X509 CRL", pq_crl);

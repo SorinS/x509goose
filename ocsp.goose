@@ -412,7 +412,9 @@ fn ocsp_create_response(issuer: const Cert&, responder: const Cert&, key: const 
     var basic: u8[>..] = [];
     basic.append(tbs);
     basic.append(sig_alg_id(alg, h));
-    asn1::put_bits(basic, sign(key, alg, h, tbs));
+    let sig, oks = sign(key, alg, h, tbs);
+    if !oks { return none, ERR_SIGNING; }
+    asn1::put_bits(basic, sig);
     if include_cert {
         var certs: u8[>..] = [];
         asn1::put(certs, asn1::SEQUENCE, responder.der);

@@ -223,7 +223,11 @@ RFC 9881 and Go:
 DSA keys go beyond Go, which has no DSA private keys in x509. Both
 PKCS #8 and openssl's "DSA PRIVATE KEY" are read, and PKCS #8 is
 written. DSA signatures use RFC 6979 nonces; ML-DSA signing is hedged. `sign(key, alg, hash, msg)`
-signs in X.509's forms (ECDSA as DER), `sig_alg_id(alg, hash)` gives the
+signs in X.509's forms (ECDSA as DER), and returns false, as Go's
+`Sign` returns an error, when RSA's private operation fails its check
+against the public key (a fault: the signature is never released);
+`create_certificate`, `create_csr`, `create_crl` and
+`ocsp_create_response` then give `ERR_SIGNING`. `sig_alg_id(alg, hash)` gives the
 AlgorithmIdentifier, and `default_sig(kind)` gives the default algorithm.
 As in Go, the default for RSA is PKCS #1 v1.5 with SHA-256, for ECDSA
 it is the curve's own hash, and for ML-DSA the key's own set. For DSA it
@@ -261,7 +265,7 @@ let der, err = x509::create_certificate(t, x509::marshal_public_key(key), ca_der
   the subject's key, for a self-signed one). The result is parsed back
   before it is returned.
 - **Requests.** `create_csr(subject, san, key)` makes a PKCS #10 request
-  with an extensionRequest for the SAN. `parse_csr` reads one,
+  with an extensionRequest for the SAN, and OK or ERR_SIGNING. `parse_csr` reads one,
   `check_csr` checks its self-signature, and `csr_dns_names` lists its
   names.
 - **CRLs.** `create_crl(issuer, key, entries, this_update, next_update,
