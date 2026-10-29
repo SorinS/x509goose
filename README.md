@@ -286,8 +286,11 @@ its answer for that serial (or its only answer), without checking it;
 successful response whose CertID names the certificate and its issuer,
 signed by the issuer or by a responder certificate the issuer signed with
 id-kp-OCSPSigning, and current, and gives OK (good), ERR_REVOKED, or
-ERR_REVOCATION_UNKNOWN. The CertID and EKU checks are RFC 6960's and go
-beyond Go's. `ocsp_create_response(issuer, responder, key, template,
+ERR_REVOCATION_UNKNOWN. A delegated responder's certificate must also be
+within its validity at `now`, have no unknown critical extension, allow
+digitalSignature if it has keyUsage, and be the one the ResponderID names
+(by subject or by key hash). These checks are RFC 6960's (§4.2.2.2) and
+go beyond Go's. `ocsp_create_response(issuer, responder, key, template,
 produced_at, include_cert)` makes what Go's `ocsp.CreateResponse` makes,
 byte for byte; `ocsp_error_response(status)` the unsuccessful ones.
 
@@ -373,7 +376,9 @@ its arguments.
   good, revoked and unknown responses from the CA and from a delegated
   responder, parsed and checked (and refused for a responder without
   id-kp-OCSPSigning, another CA, the wrong certificate, too early or too
-  late), then made here byte for byte; the error responses.
+  late), then made here byte for byte; the error responses; delegated
+  responders made here, refused expired, not yet valid, or with a
+  keyUsage that leaves out digitalSignature.
 - `pkcs12_vectors`: 54 files from openssl (`scripts/pkcs12_vectors.py`):
   RSA and P-256 keys with their chains under nine schemes and three
   passwords, each decoding to openssl's key and certificates; wrong

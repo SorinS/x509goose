@@ -4,13 +4,16 @@
 // unknown; signed by the CA, by a delegated responder carrying its
 // certificate, by one without id-kp-OCSPSigning, by another CA) parsed,
 // checked, and made again here byte for byte where the signature is
-// deterministic; and the unsuccessful status responses.
+// deterministic; and the unsuccessful status responses. Delegated
+// responders made here must be valid at the time checked and allow
+// digitalSignature.
 import std;
 import x509 from "..";
 import asn1 from "../../asn1goose.git";
 import bignum from "../../bigmongoose.git";
 import x509.keys;
 import x509.ocsp;
+import x509.create;
 
 var failures = 0;
 var checks = 0;
@@ -52,6 +55,50 @@ fn load(name: const u8[:]) -> x509::Cert {
     let c, e = x509::parse(field("cert", name));
     assert(e == x509::OK);
     return c;
+}
+
+// A delegated responder under the CA, valid from not_before to not_after,
+// with that keyUsage (0: none); its certificate and key.
+fn responder_cert(ca: const x509::Cert&, ca_key: const x509::PrivateKey&, not_before: i64, not_after: i64,
+                  usage: u32) -> x509::Cert, x509::PrivateKey {
+    let k = x509::generate_key(x509::KEY_EC_P256);
+    var t, ok = x509::template("CN=Goose Delegated Responder", not_before, not_after);
+    t.ext_key_usage = x509::EKU_OCSP_SIGNING;
+    t.key_usage = usage;
+    let der, e = x509::create_certificate(t, x509::marshal_public_key(k), ca.der, ca_key);
+    assert(ok && e == x509::OK);
+    let c, ep = x509::parse(der);
+    assert(ep == x509::OK);
+    return c, k;
+}
+
+// What ocsp_check_response says at `now` of a good response for leaf from
+// that responder, fresh at `now`.
+fn delegated_result(ca: const x509::Cert&, leaf: const x509::Cert&, rc: const x509::Cert&,
+                    rk: const x509::PrivateKey&, now: i64) -> i64 {
+    var t = x509::ocsp_template(x509::OCSP_GOOD, leaf.der[leaf.serial.off..leaf.serial.end], now);
+    t.next_update = now + 86400;
+    let der, e = x509::ocsp_create_response(ca, rc, rk, t, now, true);
+    assert(e == x509::OK);
+    let r, er = x509::ocsp_parse_response(der);
+    assert(er == x509::OK);
+    return x509::ocsp_check_response(r, leaf, ca, now);
+}
+
+fn delegated_validity(ca: const x509::Cert&, now: i64) {
+    let ca_key, okk = x509::parse_private_key(field("key", "ca"));
+    assert(okk);
+    let leaf = load("leaf");
+    let rc, rk = responder_cert(ca, ca_key, now - 86400, now + 86400, x509::KU_DIGITAL_SIGNATURE);
+    check("delegated responder made here", delegated_result(ca, leaf, rc, rk, now) == x509::OK);
+    let rn, rnk = responder_cert(ca, ca_key, now - 86400, now + 86400, 0);
+    check("delegated responder without keyUsage", delegated_result(ca, leaf, rn, rnk, now) == x509::OK);
+    let re, rek = responder_cert(ca, ca_key, now - 86400, now - 1, x509::KU_DIGITAL_SIGNATURE);
+    check("expired responder", delegated_result(ca, leaf, re, rek, now) == x509::ERR_EXPIRED);
+    let ry, ryk = responder_cert(ca, ca_key, now + 60, now + 86400, x509::KU_DIGITAL_SIGNATURE);
+    check("responder not yet valid", delegated_result(ca, leaf, ry, ryk, now) == x509::ERR_NOT_YET_VALID);
+    let ru, ruk = responder_cert(ca, ca_key, now - 86400, now + 86400, x509::KU_KEY_ENCIPHERMENT);
+    check("responder without digitalSignature", delegated_result(ca, leaf, ru, ruk, now) == x509::ERR_KEY_USAGE);
 }
 
 fn main() {
@@ -134,6 +181,7 @@ fn main() {
     check("status 7", ej == x509::ERR_MALFORMED);
     let id, okr = x509::ocsp_parse_request("\x30\x00");
     check("empty request", !okr);
+    delegated_validity(ca, now);
     print("ocsp vectors: ", checks, " checks, ", failures, " failed");
     assert(failures == 0);
 }

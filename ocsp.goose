@@ -17,6 +17,7 @@ import keys;
 import asn1;
 import bignum;
 import bignum.hmac;
+import verify;
 
 // Certificate status, and the responseStatus of an OCSPResponse.
 let OCSP_GOOD: i64 = 0;
@@ -298,27 +299,49 @@ fn ocsp_signed_by(r: const OcspResponse&, key_cert: const Cert&) -> i64 {
     return verify_with(key_cert, r.sig_alg, r.sig_hash, r.pss_salt, d[r.tbs.start..r.tbs.end], sig);
 }
 
+// Whether a response's ResponderID names certificate c: its subject
+// (byName), or the SHA-1 of its subjectPublicKey (byKey), RFC 6960
+// §4.2.1.
+fn ocsp_names(r: const OcspResponse&, c: const Cert&) -> bool {
+    let d = r.der[..];
+    if r.responder_name.end > r.responder_name.start {
+        return d[r.responder_name.start..r.responder_name.end] == c.der[c.subject.start..c.subject.end];
+    }
+    if r.responder_key_hash.end > r.responder_key_hash.start {
+        let kb, ok = key_bytes(c.der, c.key);
+        return ok && bignum::hash_bits(160, kb)[..] == d[r.responder_key_hash.off..r.responder_key_hash.end];
+    }
+    return false;
+}
+
 // Whether a response vouches for c, issued by issuer, at `now` (0: now):
 // a successful response, its CertID naming c and issuer, signed by the
 // issuer or by a responder certificate the issuer signed for OCSP
-// signing, current (thisUpdate passed, nextUpdate if any not). Then OK
-// for good, ERR_REVOKED, or ERR_REVOCATION_UNKNOWN for unknown.
+// signing, current (thisUpdate passed, nextUpdate if any not). A
+// delegated responder's certificate must itself be valid at `now`, with
+// no unknown critical extension, allow digitalSignature if it has
+// keyUsage, and be the one the ResponderID names (RFC 6960 §4.2.2.2).
+// Then OK for good, ERR_REVOKED, or ERR_REVOCATION_UNKNOWN for unknown.
 fn ocsp_check_response(r: const OcspResponse&, c: const Cert&, issuer: const Cert&, now: i64 = 0) -> i64 {
     if r.response_status != OCSP_SUCCESS { return ERR_REVOCATION_UNKNOWN; }
     let want = ocsp_cert_id(c, issuer, r.id.hash);
     if want.name_hash != r.id.name_hash || want.key_hash != r.id.key_hash || want.serial != r.id.serial {
         return ERR_UNKNOWN_ISSUER;
     }
+    let t = if now == 0 { time() as i64 } else { now };
     let direct = ocsp_signed_by(r, issuer);
     if direct != OK {
         let rc, e = ocsp_responder_cert(r);
         if e != OK { return direct; }
         if !issued_by(rc, issuer) || check_signature(rc, issuer) != OK { return ERR_UNKNOWN_ISSUER; }
         if !rc.has_ext_key_usage || rc.ext_key_usage & EKU_OCSP_SIGNING == 0 { return ERR_EXTENDED_KEY_USAGE; }
+        let ce = check_common(rc, t);
+        if ce != OK { return ce; }
+        if rc.has_key_usage && rc.key_usage & KU_DIGITAL_SIGNATURE == 0 { return ERR_KEY_USAGE; }
+        if !ocsp_names(r, rc) { return ERR_UNKNOWN_ISSUER; }
         let e2 = ocsp_signed_by(r, rc);
         if e2 != OK { return e2; }
     }
-    let t = if now == 0 { time() as i64 } else { now };
     if t < r.this_update { return ERR_NOT_YET_VALID; }
     if r.next_update >= 0 && t >= r.next_update { return ERR_EXPIRED; }
     if r.status == OCSP_REVOKED { return ERR_REVOKED; }
