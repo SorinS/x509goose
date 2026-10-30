@@ -850,22 +850,6 @@ fn verify_with(key_cert: const Cert&, alg: i64, h: i64, salt: i64, msg: const u8
     let d = key_cert.der[..];
     let kb, okk = key_bytes(d, key_cert.key);
     if !okk { return ERR_MALFORMED; }
-    if alg == SIG_RSA_PKCS1 || alg == SIG_RSA_PSS {
-        if key_cert.key_type != KEY_RSA { return ERR_BAD_SIGNATURE; }
-        let pub, e = rsa_key_of(kb);
-        if e != OK { return e; }
-        let good = if alg == SIG_RSA_PKCS1 { bignum::rsa_verify_pkcs1(pub, msg, sig, h) }
-                   else { bignum::rsa_verify_pss(pub, msg, sig, salt, h) };
-        return if good { OK } else { ERR_BAD_SIGNATURE };
-    }
-    if alg == SIG_ECDSA {
-        if !is_ec(key_cert.key_type) { return ERR_BAD_SIGNATURE; }
-        let curve = curve_of_key(key_cert.key_type);
-        let raw, okd = bignum::ecdsa_sig_from_der(curve, sig);
-        if !okd { return ERR_BAD_SIGNATURE; }
-        let good = bignum::ecdsa_verify_digest(curve, kb, bignum::hash_bits(h, msg), raw);
-        return if good { OK } else { ERR_BAD_SIGNATURE };
-    }
     if alg == SIG_ED25519 {
         if key_cert.key_type != KEY_ED25519 { return ERR_BAD_SIGNATURE; }
         return if bignum::ed25519_verify(kb, msg, sig) { OK } else { ERR_BAD_SIGNATURE };
@@ -876,15 +860,40 @@ fn verify_with(key_cert: const Cert&, alg: i64, h: i64, salt: i64, msg: const u8
         if kb.len != bignum::mldsa_pk_len(h) { return ERR_MALFORMED; }
         return if bignum::mldsa_verify(h, kb, msg, sig) { OK } else { ERR_BAD_SIGNATURE };
     }
-    if alg == SIG_DSA {
-        if key_cert.key_type != KEY_DSA { return ERR_BAD_SIGNATURE; }
-        let k, okd = dsa_public_of(d, key_cert.spki);
-        if !okd { return ERR_MALFORMED; }
-        let raw, okr = bignum::dsa_sig_from_der(k, sig);
-        if !okr { return ERR_BAD_SIGNATURE; }
-        return if bignum::dsa_verify(k, bignum::hash_bits(h, msg), raw) { OK } else { ERR_BAD_SIGNATURE };
+    if alg != SIG_RSA_PKCS1 && alg != SIG_RSA_PSS && alg != SIG_ECDSA && alg != SIG_DSA { return ERR_UNSUPPORTED_ALGORITHM; }
+    return verify_digest(key_cert, alg, h, salt, bignum::hash_bits(h, msg), sig);
+}
+
+// The same over a digest made by the hash h: RSA, ECDSA and DSA;
+// ERR_UNSUPPORTED_ALGORITHM for Ed25519 and ML-DSA, which sign messages,
+// and ERR_BAD_SIGNATURE for a digest of another length.
+fn verify_digest(key_cert: const Cert&, alg: i64, h: i64, salt: i64, digest: const u8[:], sig: const u8[:]) -> i64 {
+    if alg != SIG_RSA_PKCS1 && alg != SIG_RSA_PSS && alg != SIG_ECDSA && alg != SIG_DSA { return ERR_UNSUPPORTED_ALGORITHM; }
+    let d = key_cert.der[..];
+    let kb, okk = key_bytes(d, key_cert.key);
+    if !okk { return ERR_MALFORMED; }
+    if digest.len != bignum::hash_len(h) { return ERR_BAD_SIGNATURE; }
+    if alg == SIG_RSA_PKCS1 || alg == SIG_RSA_PSS {
+        if key_cert.key_type != KEY_RSA { return ERR_BAD_SIGNATURE; }
+        let pub, e = rsa_key_of(kb);
+        if e != OK { return e; }
+        let good = if alg == SIG_RSA_PKCS1 { bignum::rsa_verify_pkcs1_digest(pub, digest, sig, h) }
+                   else { bignum::rsa_verify_pss_digest(pub, digest, sig, salt, h) };
+        return if good { OK } else { ERR_BAD_SIGNATURE };
     }
-    return ERR_UNSUPPORTED_ALGORITHM;
+    if alg == SIG_ECDSA {
+        if !is_ec(key_cert.key_type) { return ERR_BAD_SIGNATURE; }
+        let curve = curve_of_key(key_cert.key_type);
+        let raw, okd = bignum::ecdsa_sig_from_der(curve, sig);
+        if !okd { return ERR_BAD_SIGNATURE; }
+        return if bignum::ecdsa_verify_digest(curve, kb, digest, raw) { OK } else { ERR_BAD_SIGNATURE };
+    }
+    if key_cert.key_type != KEY_DSA { return ERR_BAD_SIGNATURE; }
+    let k, okd = dsa_public_of(d, key_cert.spki);
+    if !okd { return ERR_MALFORMED; }
+    let raw, okr = bignum::dsa_sig_from_der(k, sig);
+    if !okr { return ERR_BAD_SIGNATURE; }
+    return if bignum::dsa_verify(k, digest, raw) { OK } else { ERR_BAD_SIGNATURE };
 }
 
 // Whether `issuer`'s key signed c.

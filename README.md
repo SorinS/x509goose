@@ -232,6 +232,11 @@ against the public key (a fault: the signature is never released);
 `create_certificate`, `create_csr`, `create_crl` and
 `ocsp_create_response` then give `ERR_SIGNING`. `sig_alg_id(alg, hash)` gives the
 AlgorithmIdentifier, and `default_sig(kind)` gives the default algorithm.
+`sign_digest(key, alg, hash, digest)` and `verify_digest(cert, alg, hash,
+salt, digest, sig)` take a digest the caller made, as Go's `crypto.Signer`
+does, for RSA, ECDSA and DSA (TLS 1.2's CertificateVerify hashes as the
+handshake goes); Ed25519 and ML-DSA sign messages, so they give false and
+`ERR_UNSUPPORTED_ALGORITHM`.
 As in Go, the default for RSA is PKCS #1 v1.5 with SHA-256, for ECDSA
 it is the curve's own hash, and for ML-DSA the key's own set. For DSA it
 is SHA-256, as in openssl.

@@ -108,6 +108,26 @@ fn path_search_bounded(root: const u8[:]) {
     check("decoys, then the issuer", x509::verify_chain(busy, some, roots, NOW, "") == x509::OK);
 }
 
+// sign_digest and verify_digest under one key, against sign and
+// verify_with over the message.
+fn digest_checks(kind: const u8[:], k: const x509::PrivateKey&, alg: i64, h: i64, salt: i64) {
+    let c, e = x509::parse(ca_cert("CN=Goose Digest", 7, k));
+    assert(e == x509::OK);
+    let msg = "handshake messages";
+    let d = bignum::hash_bits(h, msg);
+    let s1, ok1 = x509::sign_digest(k, alg, h, d);
+    check(str(kind, " sign_digest"), ok1);
+    check(str(kind, " its signature verifies"), x509::verify_with(c, alg, h, salt, msg, s1) == x509::OK);
+    let s2, ok2 = x509::sign(k, alg, h, msg);
+    check(str(kind, " verify_digest"), ok2 && x509::verify_digest(c, alg, h, salt, d, s2) == x509::OK);
+    check(str(kind, " other digest refused"),
+          x509::verify_digest(c, alg, h, salt, bignum::hash_bits(h, "other messages"), s2) == x509::ERR_BAD_SIGNATURE);
+    let short = d[..d.len - 1];
+    let s3, ok3 = x509::sign_digest(k, alg, h, short);
+    check(str(kind, " short digest not signed"), !ok3 && s3.len == 0);
+    check(str(kind, " short digest refused"), x509::verify_digest(c, alg, h, salt, short, s2) == x509::ERR_BAD_SIGNATURE);
+}
+
 fn main() {
     // Keys: parse and marshal against openssl's bytes.
     for kind in ["rsa", "p256", "p384", "p521", "ed25519", "p224"] {
@@ -127,6 +147,27 @@ fn main() {
     }
     let bad, okbad = x509::parse_private_key("junk");
     check("bad key", !okbad);
+
+    // Signatures over digests: RSA, ECDSA (any hash on any curve), and
+    // none for Ed25519, which signs messages.
+    let rsa_key, okrk = x509::parse_private_key(key_line("rsa", 2));
+    check("rsa key", okrk);
+    digest_checks("pkcs1 sha256", rsa_key, x509::SIG_RSA_PKCS1, 256, 0);
+    digest_checks("pkcs1 sha512", rsa_key, x509::SIG_RSA_PKCS1, 512, 0);
+    digest_checks("pss sha256", rsa_key, x509::SIG_RSA_PSS, 256, 32);
+    digest_checks("pss sha384", rsa_key, x509::SIG_RSA_PSS, 384, 48);
+    let p256_key = x509::generate_key(x509::KEY_EC_P256);
+    digest_checks("p256 sha256", p256_key, x509::SIG_ECDSA, 256, 0);
+    digest_checks("p256 sha512", p256_key, x509::SIG_ECDSA, 512, 0);
+    let p384_key = x509::generate_key(x509::KEY_EC_P384);
+    digest_checks("p384 sha256", p384_key, x509::SIG_ECDSA, 256, 0);
+    let ed_key = x509::generate_key(x509::KEY_ED25519);
+    let ed_cert, eed = x509::parse(ca_cert("CN=Goose Ed", 8, ed_key));
+    let eds, oked = x509::sign_digest(ed_key, x509::SIG_ED25519, 0, "");
+    check("ed25519 sign_digest refused", !oked && eds.len == 0);
+    let edsig, okes = x509::sign(ed_key, x509::SIG_ED25519, 0, "m");
+    check("ed25519 verify_digest refused", eed == x509::OK && okes &&
+          x509::verify_digest(ed_cert, x509::SIG_ED25519, 0, 0, "", edsig) == x509::ERR_UNSUPPORTED_ALGORITHM);
 
     // A root, self-signed.
     let root_key = x509::generate_key(x509::KEY_EC_P384);
