@@ -40,6 +40,17 @@ fn dns_within(name0: const u8[:], base0: const u8[:]) -> bool {
     return name.len > base.len && ends_with_nocase(name, base) && name[name.len - base.len - 1] == '.';
 }
 
+// Whether a wildcard dNSName "*.X" could stand for a name in the subtree
+// base: it is taken to cover every name under X, so an excluded subtree
+// anywhere under X excludes it.
+fn wildcard_meets(name0: const u8[:], base0: const u8[:]) -> bool {
+    let name = strip_dot(name0);
+    if name.len < 2 || name[0] != '*' || name[1] != '.' { return false; }
+    var base = strip_dot(base0);
+    if base.len > 0 && base[0] == '.' { base = base[1..]; }
+    return dns_within(base, name[2..]);
+}
+
 // A mailbox within an rfc822Name subtree: "user@host" exactly, "host"
 // for that host, ".host" for hosts under it.
 fn email_within(mail: const u8[:], base: const u8[:]) -> bool {
@@ -163,7 +174,9 @@ fn check_name(ca: const Cert&, kind: u32, nd: const u8[:], t: asn1::Tlv) -> i64 
             let b = base[0];
             if b.number != kind { continue; }
             let hit = within(kind, nd, t, cd, b);
-            if part.number == 1 && hit { return ERR_NAME_CONSTRAINTS; }
+            if part.number == 1 && (hit || (kind == GN_DNS && wildcard_meets(nd[t.off..t.end], cd[b.off..b.end]))) {
+                return ERR_NAME_CONSTRAINTS;
+            }
             if part.number == 0 {
                 permitted_of_kind = true;
                 if hit { permitted = true; }

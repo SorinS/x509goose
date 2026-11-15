@@ -36,6 +36,7 @@ struct Crl {
     has_revoked: bool, revoked: asn1::Tlv,       // SEQUENCE OF entries
     crl_number: i64,                             // -1: absent or too big
     only_user: bool, only_ca: bool,              // issuingDistributionPoint scope
+    has_dp: bool, dp: asn1::Tlv,                 // its distributionPoint's fullName (GeneralNames)
     unsupported: bool,                           // delta, indirect, by reason, unknown critical
     der: u8[>..],
 }
@@ -44,15 +45,16 @@ fn empty_crl() -> Crl {
     Crl {
         version: 1, tbs: no_tlv(), sig_alg: SIG_UNKNOWN, sig_hash: 0, pss_salt: 0, sig: no_tlv(),
         issuer: no_tlv(), this_update: 0, next_update: -1, has_revoked: false, revoked: no_tlv(),
-        crl_number: -1, only_user: false, only_ca: false, unsupported: false, der: [],
+        crl_number: -1, only_user: false, only_ca: false, has_dp: false, dp: no_tlv(), unsupported: false,
+        der: [],
     }
 }
 
-// IssuingDistributionPoint: only the two scope flags are understood; a
-// reason subset or an indirect CRL makes it unsupported. (Its
-// distributionPoint names which CRL this is, which matters only for
-// partitioned CRLs; a CRL that has one is still matched to certificates by
-// issuer alone.)
+// IssuingDistributionPoint: the two scope flags and a distributionPoint
+// fullName are understood; a reason subset, an indirect CRL or a name
+// relative to the issuer makes it unsupported. A distributionPoint names
+// which partition of the issuer's CRLs this is: it covers only the
+// certificates that point to it (RFC 5280 §6.3.3 (b)(2)(i)).
 fn parse_idp(c: Crl&, d: const u8[:], t: asn1::Tlv) -> bool {
     let fs, ok = asn1::children_of(d, t, asn1::SEQUENCE);
     if !ok { return false; }
@@ -67,9 +69,24 @@ fn parse_idp(c: Crl&, d: const u8[:], t: asn1::Tlv) -> bool {
             if f.number == 2 { c.only_ca = true; }
             if f.number == 4 { c.unsupported = true; }   // indirectCRL
             if f.number == 5 { c.unsupported = true; }   // onlyContainsAttributeCerts
+        } else if f.number == 0 {
+            // distributionPoint [0] DistributionPointName, a CHOICE.
+            let n, okn = asn1::explicit(d, f);
+            if !f.constructed || !okn { return false; }
+            if n.tag == asn1::ctx(0, true) {
+                let gns, okg = asn1::children(d, n);
+                if !okg || gns.len == 0 { return false; }
+                for g in gns { if !general_name_ok(g) { return false; } }
+                c.has_dp = true;
+                c.dp = n;
+            } else if n.tag == asn1::ctx(1, true) {
+                c.unsupported = true;                    // nameRelativeToCRLIssuer
+            } else {
+                return false;
+            }
         } else if f.number == 3 {
             c.unsupported = true;                        // onlySomeReasons
-        } else if f.number != 0 {
+        } else {
             return false;
         }
     }
@@ -179,12 +196,38 @@ fn parse_crl(der: const u8[:]) -> Crl, i64 {
     return c, OK;
 }
 
+// Whether one of the names of a CRL's distributionPoint is among the
+// fullNames of c's CRL distribution points, the same DER.
+fn dp_matches(crl: const Crl&, c: const Cert&) -> bool {
+    if !c.has_crl_dp { return false; }
+    let cd = crl.der[..];
+    let wanted, okw = asn1::children(cd, crl.dp);
+    let d = c.der[..];
+    let dps, ok = asn1::children(d, c.crl_dp);
+    for dp in dps {
+        let fs, okf = asn1::children(d, dp);
+        for f in fs {
+            if f.tag != asn1::ctx(0, true) { continue; }         // distributionPoint
+            let names, okn = asn1::children(d, f);
+            for n in names {
+                if n.tag != asn1::ctx(0, true) { continue; }     // fullName
+                let gns, okg = asn1::children(d, n);
+                for g in gns {
+                    for w in wanted { if cd[w.start..w.end] == d[g.start..g.end] { return true; } }
+                }
+            }
+        }
+    }
+    return false;
+}
+
 // Whether the CRL covers c: the same issuer and, when it is scoped, the
-// right kind of certificate.
+// right kind of certificate, and one of the distribution points c names.
 fn crl_covers(crl: const Crl&, c: const Cert&) -> bool {
     if crl.der[crl.issuer.start..crl.issuer.end] != c.der[c.issuer.start..c.issuer.end] { return false; }
     if crl.only_user && c.is_ca { return false; }
     if crl.only_ca && !c.is_ca { return false; }
+    if crl.has_dp && !dp_matches(crl, c) { return false; }
     return true;
 }
 

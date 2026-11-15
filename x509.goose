@@ -10,13 +10,15 @@
 namespace x509;
 
 import std;
-import asn1 from "../asn1goose.git";
-import bignum from "../bigmongoose.git";
+import bignum from "SorinS/bigmongoose@v0.7.0";
+import asn1 from "SorinS/asn1goose@v0.7.0";
 import bignum.rsa;
 import bignum.ec;
 import bignum.ed25519;
+import bignum.ed448;
 import bignum.hmac;
 import bignum.mldsa;
+import bignum.slhdsa;
 import bignum.dsa;
 
 // Errors, from parsing or validation; OK is 0.
@@ -40,6 +42,8 @@ let ERR_REVOKED: i64 = 16;
 let ERR_REVOCATION_UNKNOWN: i64 = 17;
 let ERR_SIGNING: i64 = 18;
 let ERR_TOO_MANY_SIGNATURES: i64 = 19;
+let ERR_CMS_NOT_RECIPIENT: i64 = 20;     // no RecipientInfo names the certificate (x509.cms_env)
+let ERR_CMS_DECRYPT: i64 = 21;           // the key or the content does not decrypt (x509.cms_env)
 
 fn error_text(e: i64) -> const u8[:] {
     if e == OK { return "ok"; }
@@ -62,6 +66,8 @@ fn error_text(e: i64) -> const u8[:] {
     if e == ERR_REVOCATION_UNKNOWN { return "revocation status unknown"; }
     if e == ERR_SIGNING { return "signing failed"; }
     if e == ERR_TOO_MANY_SIGNATURES { return "too many signature checks building the chain"; }
+    if e == ERR_CMS_NOT_RECIPIENT { return "not a recipient of the message"; }
+    if e == ERR_CMS_DECRYPT { return "does not decrypt"; }
     return "unknown error";
 }
 
@@ -73,6 +79,8 @@ let SIG_ECDSA: i64 = 3;              // with sig_hash
 let SIG_ED25519: i64 = 4;
 let SIG_MLDSA: i64 = 5;              // sig_hash holds the parameter set: 44, 65 or 87
 let SIG_DSA: i64 = 6;                // with sig_hash (224, 256, 384, 512)
+let SIG_SLHDSA: i64 = 7;             // sig_hash holds the bignum::SLHDSA_* set, 1 to 12
+let SIG_ED448: i64 = 8;              // pure Ed448, the empty context (RFC 8410)
 
 // Public key types.
 let KEY_UNKNOWN: i64 = 0;
@@ -86,6 +94,29 @@ let KEY_MLDSA44: i64 = 7;
 let KEY_MLDSA65: i64 = 8;
 let KEY_MLDSA87: i64 = 9;
 let KEY_DSA: i64 = 10;
+// SLH-DSA (RFC 9909): the set plus 19, as the OIDs' last arcs.
+let KEY_SLHDSA_SHA2_128S: i64 = 20;
+let KEY_SLHDSA_SHA2_128F: i64 = 21;
+let KEY_SLHDSA_SHA2_192S: i64 = 22;
+let KEY_SLHDSA_SHA2_192F: i64 = 23;
+let KEY_SLHDSA_SHA2_256S: i64 = 24;
+let KEY_SLHDSA_SHA2_256F: i64 = 25;
+let KEY_SLHDSA_SHAKE_128S: i64 = 26;
+let KEY_SLHDSA_SHAKE_128F: i64 = 27;
+let KEY_SLHDSA_SHAKE_192S: i64 = 28;
+let KEY_SLHDSA_SHAKE_192F: i64 = 29;
+let KEY_SLHDSA_SHAKE_256S: i64 = 30;
+let KEY_SLHDSA_SHAKE_256F: i64 = 31;
+let KEY_MLKEM512: i64 = 40;          // ML-KEM (RFC 9935): encryption only (CMS, cms_env)
+let KEY_MLKEM768: i64 = 41;
+let KEY_MLKEM1024: i64 = 42;
+// brainpoolP256r1, P384r1 and P512r1 (RFC 5639) under id-ecPublicKey,
+// for ECDSA and ECDH as the NIST curves are.
+let KEY_EC_BP256: i64 = 43;
+let KEY_EC_BP384: i64 = 44;
+let KEY_EC_BP512: i64 = 45;
+let KEY_ED448: i64 = 46;             // id-Ed448 (RFC 8410): signatures
+let KEY_X448: i64 = 47;              // id-X448 (RFC 8410): key agreement only (CMS, cms_env)
 
 // Key usage bits (RFC 5280 §4.2.1.3), as KU_* masks of Cert.key_usage.
 let KU_DIGITAL_SIGNATURE: u32 = 1;
@@ -212,14 +243,17 @@ fn sig_alg_of(der: const u8[:], t: asn1::Tlv) -> i64, i64, i64 {
         if asn1::oid_is(der, oid, "1.2.840.113549.1.1.12") { return SIG_RSA_PKCS1, 384, 0; }
         if asn1::oid_is(der, oid, "1.2.840.113549.1.1.13") { return SIG_RSA_PKCS1, 512, 0; }
     }
-    // ECDSA and Ed25519 identifiers carry no parameters at all.
+    // ECDSA, Ed25519 and Ed448 identifiers carry no parameters at all.
     if p.len == 1 {
         if asn1::oid_is(der, oid, "1.2.840.10045.4.3.2") { return SIG_ECDSA, 256, 0; }
         if asn1::oid_is(der, oid, "1.2.840.10045.4.3.3") { return SIG_ECDSA, 384, 0; }
         if asn1::oid_is(der, oid, "1.2.840.10045.4.3.4") { return SIG_ECDSA, 512, 0; }
         if asn1::oid_is(der, oid, "1.3.101.112") { return SIG_ED25519, 0, 0; }
+        if asn1::oid_is(der, oid, "1.3.101.113") { return SIG_ED448, 0, 0; }
         let set = mldsa_set_of_oid(der, oid);
         if set != 0 { return SIG_MLDSA, set, 0; }
+        let slh = slhdsa_set_of_oid(der, oid);
+        if slh != 0 { return SIG_SLHDSA, slh, 0; }
         if asn1::oid_is(der, oid, "2.16.840.1.101.3.4.3.1") { return SIG_DSA, 224, 0; }
         if asn1::oid_is(der, oid, "2.16.840.1.101.3.4.3.2") { return SIG_DSA, 256, 0; }
         if asn1::oid_is(der, oid, "2.16.840.1.101.3.4.3.3") { return SIG_DSA, 384, 0; }
@@ -238,6 +272,9 @@ fn ec_named_curve(der: const u8[:], o: asn1::Tlv) -> i64 {
     if asn1::oid_is(der, o, "1.3.132.0.34") { return KEY_EC_P384; }
     if asn1::oid_is(der, o, "1.3.132.0.35") { return KEY_EC_P521; }
     if asn1::oid_is(der, o, "1.3.132.0.33") { return KEY_EC_P224; }
+    if asn1::oid_is(der, o, "1.3.36.3.3.2.8.1.1.7") { return KEY_EC_BP256; }
+    if asn1::oid_is(der, o, "1.3.36.3.3.2.8.1.1.11") { return KEY_EC_BP384; }
+    if asn1::oid_is(der, o, "1.3.36.3.3.2.8.1.1.13") { return KEY_EC_BP512; }
     return KEY_UNKNOWN;
 }
 
@@ -255,9 +292,44 @@ fn is_mldsa(kind: i64) -> bool { kind == KEY_MLDSA44 || kind == KEY_MLDSA65 || k
 fn mldsa_set(kind: i64) -> i64 { if kind == KEY_MLDSA44 { 44 } else if kind == KEY_MLDSA65 { 65 } else { 87 } }
 fn mldsa_kind(set: i64) -> i64 { if set == 44 { KEY_MLDSA44 } else if set == 65 { KEY_MLDSA65 } else { KEY_MLDSA87 } }
 
-fn is_ec(kind: i64) -> bool {
-    kind == KEY_EC_P256 || kind == KEY_EC_P384 || kind == KEY_EC_P521 || kind == KEY_EC_P224
+// The SLH-DSA set (bignum::SLHDSA_*, 1 to 12) of an id-slh-dsa-* OID
+// (2.16.840.1.101.3.4.3.20 to .31), or 0; its OID; the key type of a set,
+// and back.
+fn slhdsa_oid(set: i64) -> const u8[:] {
+    let oids = ["2.16.840.1.101.3.4.3.20", "2.16.840.1.101.3.4.3.21", "2.16.840.1.101.3.4.3.22",
+                "2.16.840.1.101.3.4.3.23", "2.16.840.1.101.3.4.3.24", "2.16.840.1.101.3.4.3.25",
+                "2.16.840.1.101.3.4.3.26", "2.16.840.1.101.3.4.3.27", "2.16.840.1.101.3.4.3.28",
+                "2.16.840.1.101.3.4.3.29", "2.16.840.1.101.3.4.3.30", "2.16.840.1.101.3.4.3.31"];
+    return oids[set - 1];
 }
+fn slhdsa_set_of_oid(der: const u8[:], o: asn1::Tlv) -> i64 {
+    for set in 1..13 { if asn1::oid_is(der, o, slhdsa_oid(set)) { return set; } }
+    return 0;
+}
+fn is_slhdsa(kind: i64) -> bool { kind >= KEY_SLHDSA_SHA2_128S && kind <= KEY_SLHDSA_SHAKE_256F }
+fn slhdsa_set(kind: i64) -> i64 { kind - 19 }
+fn slhdsa_kind(set: i64) -> i64 { set + 19 }
+
+// The ML-KEM k (2, 3, 4: ML-KEM-512, -768, -1024) of an id-alg-ml-kem-*
+// OID (RFC 9935), or 0; the key types of each k, and back.
+fn mlkem_k_of_oid(der: const u8[:], o: asn1::Tlv) -> i64 {
+    if asn1::oid_is(der, o, "2.16.840.1.101.3.4.4.1") { return 2; }
+    if asn1::oid_is(der, o, "2.16.840.1.101.3.4.4.2") { return 3; }
+    if asn1::oid_is(der, o, "2.16.840.1.101.3.4.4.3") { return 4; }
+    return 0;
+}
+fn is_mlkem(kind: i64) -> bool { kind == KEY_MLKEM512 || kind == KEY_MLKEM768 || kind == KEY_MLKEM1024 }
+fn mlkem_k(kind: i64) -> i64 { if kind == KEY_MLKEM512 { 2 } else if kind == KEY_MLKEM768 { 3 } else { 4 } }
+fn mlkem_kind(k: i64) -> i64 { if k == 2 { KEY_MLKEM512 } else if k == 3 { KEY_MLKEM768 } else { KEY_MLKEM1024 } }
+fn mlkem_oid(k: i64) -> const u8[:] {
+    if k == 2 { "2.16.840.1.101.3.4.4.1" } else if k == 3 { "2.16.840.1.101.3.4.4.2" } else { "2.16.840.1.101.3.4.4.3" }
+}
+
+fn is_ec(kind: i64) -> bool {
+    kind == KEY_EC_P256 || kind == KEY_EC_P384 || kind == KEY_EC_P521 || kind == KEY_EC_P224 || is_brainpool(kind)
+}
+
+fn is_brainpool(kind: i64) -> bool { kind == KEY_EC_BP256 || kind == KEY_EC_BP384 || kind == KEY_EC_BP512 }
 
 // The curve of an EC key type.
 fn curve_of_key(kind: i64) -> bignum::Curve {
@@ -265,7 +337,19 @@ fn curve_of_key(kind: i64) -> bignum::Curve {
     if kind == KEY_EC_P256 { return bignum::p256(); }
     if kind == KEY_EC_P384 { return bignum::p384(); }
     if kind == KEY_EC_P224 { return bignum::p224(); }
+    if kind == KEY_EC_BP256 { return bignum::bp256(); }
+    if kind == KEY_EC_BP384 { return bignum::bp384(); }
+    if kind == KEY_EC_BP512 { return bignum::bp512(); }
     return bignum::p521();
+}
+
+// The hash an EC key type signs and derives keys with by default: SHA-256
+// for P-256, P-224 and brainpoolP256r1, SHA-384 for the 384-bit curves,
+// SHA-512 for P-521 and brainpoolP512r1.
+fn ec_hash_of_key(kind: i64) -> i64 {
+    if kind == KEY_EC_P384 || kind == KEY_EC_BP384 { return 384; }
+    if kind == KEY_EC_P521 || kind == KEY_EC_BP512 { return 512; }
+    return 256;
 }
 
 // The key type of a SubjectPublicKeyInfo, and its subjectPublicKey.
@@ -281,8 +365,16 @@ fn spki_of(der: const u8[:], t: asn1::Tlv) -> i64, asn1::Tlv, bool {
         kind = ec_named_curve(der, alg[1]);
     } else if asn1::oid_is(der, alg[0], "1.3.101.112") && alg.len == 1 {
         kind = KEY_ED25519;
+    } else if asn1::oid_is(der, alg[0], "1.3.101.113") && alg.len == 1 {
+        kind = KEY_ED448;
+    } else if asn1::oid_is(der, alg[0], "1.3.101.111") && alg.len == 1 {
+        kind = KEY_X448;
     } else if mldsa_set_of_oid(der, alg[0]) != 0 && alg.len == 1 {
         kind = mldsa_kind(mldsa_set_of_oid(der, alg[0]));
+    } else if slhdsa_set_of_oid(der, alg[0]) != 0 && alg.len == 1 {
+        kind = slhdsa_kind(slhdsa_set_of_oid(der, alg[0]));
+    } else if mlkem_k_of_oid(der, alg[0]) != 0 && alg.len == 1 {
+        kind = mlkem_kind(mlkem_k_of_oid(der, alg[0]));
     } else if asn1::oid_is(der, alg[0], "1.2.840.10040.4.1") && alg.len == 2 {
         // Parameters inherited from the issuer (absent) are not supported.
         kind = KEY_DSA;
@@ -328,6 +420,15 @@ fn key_bytes(der: const u8[:], t: asn1::Tlv) -> u8[>..], bool {
 
 let ANY_POLICY: const u8[:] = "2.5.29.32.0";
 
+// A GeneralName's tag: context class, [0] to [8], constructed for
+// otherName, x400Address, directoryName and ediPartyName and primitive
+// for the rest. Name checks go by number, so nothing else may pass.
+fn general_name_ok(n: asn1::Tlv) -> bool {
+    if n.cls != asn1::CLASS_CONTEXT || n.number > 8 { return false; }
+    let cons = n.number == 0 || n.number == 3 || n.number == 4 || n.number == 5;
+    return n.constructed == cons;
+}
+
 // GeneralSubtrees: each a SEQUENCE of a GeneralName and no minimum or
 // maximum (RFC 5280 says they must be absent for the name forms in use).
 fn subtrees_ok(der: const u8[:], t: asn1::Tlv) -> bool {
@@ -335,7 +436,7 @@ fn subtrees_ok(der: const u8[:], t: asn1::Tlv) -> bool {
     if !ok || subs.len == 0 { return false; }
     for s in subs {
         let p, okp = asn1::children_of(der, s, asn1::SEQUENCE);
-        if !okp || p.len != 1 || p[0].cls != asn1::CLASS_CONTEXT { return false; }
+        if !okp || p.len != 1 || !general_name_ok(p[0]) { return false; }
     }
     return true;
 }
@@ -474,6 +575,7 @@ fn parse_extensions(c: Cert&, der: const u8[:], t: asn1::Tlv) -> bool {
         } else if asn1::oid_is(der, f[0], "2.5.29.17") {
             let ns, okn = asn1::children_of(der, inner, asn1::SEQUENCE);
             if !oki || inner.end != val.end || !okn || ns.len == 0 { return false; }
+            for n in ns { if !general_name_ok(n) { return false; } }
             c.has_san = true;
             c.san = inner;
         } else if asn1::oid_is(der, f[0], "2.5.29.14") {
@@ -854,18 +956,29 @@ fn verify_with(key_cert: const Cert&, alg: i64, h: i64, salt: i64, msg: const u8
         if key_cert.key_type != KEY_ED25519 { return ERR_BAD_SIGNATURE; }
         return if bignum::ed25519_verify(kb, msg, sig) { OK } else { ERR_BAD_SIGNATURE };
     }
+    if alg == SIG_ED448 {
+        // Pure Ed448 with the empty context (RFC 8410 §6).
+        if key_cert.key_type != KEY_ED448 { return ERR_BAD_SIGNATURE; }
+        return if bignum::ed448_verify(kb, msg, sig) { OK } else { ERR_BAD_SIGNATURE };
+    }
     if alg == SIG_MLDSA {
         // Pure ML-DSA with the empty context (RFC 9881); the set must be the key's.
         if !is_mldsa(key_cert.key_type) || mldsa_set(key_cert.key_type) != h { return ERR_BAD_SIGNATURE; }
         if kb.len != bignum::mldsa_pk_len(h) { return ERR_MALFORMED; }
         return if bignum::mldsa_verify(h, kb, msg, sig) { OK } else { ERR_BAD_SIGNATURE };
     }
+    if alg == SIG_SLHDSA {
+        // Pure SLH-DSA with the empty context (RFC 9909); the set must be the key's.
+        if !is_slhdsa(key_cert.key_type) || slhdsa_set(key_cert.key_type) != h { return ERR_BAD_SIGNATURE; }
+        if kb.len != bignum::slhdsa_pk_len(h) { return ERR_MALFORMED; }
+        return if bignum::slhdsa_verify(h, kb, msg, sig) { OK } else { ERR_BAD_SIGNATURE };
+    }
     if alg != SIG_RSA_PKCS1 && alg != SIG_RSA_PSS && alg != SIG_ECDSA && alg != SIG_DSA { return ERR_UNSUPPORTED_ALGORITHM; }
     return verify_digest(key_cert, alg, h, salt, bignum::hash_bits(h, msg), sig);
 }
 
 // The same over a digest made by the hash h: RSA, ECDSA and DSA;
-// ERR_UNSUPPORTED_ALGORITHM for Ed25519 and ML-DSA, which sign messages,
+// ERR_UNSUPPORTED_ALGORITHM for Ed25519, Ed448, ML-DSA and SLH-DSA, which sign messages,
 // and ERR_BAD_SIGNATURE for a digest of another length.
 fn verify_digest(key_cert: const Cert&, alg: i64, h: i64, salt: i64, digest: const u8[:], sig: const u8[:]) -> i64 {
     if alg != SIG_RSA_PKCS1 && alg != SIG_RSA_PSS && alg != SIG_ECDSA && alg != SIG_DSA { return ERR_UNSUPPORTED_ALGORITHM; }
@@ -916,6 +1029,12 @@ let RSA_PSS_RSAE_SHA256: u16 = 0x0804;
 let RSA_PSS_RSAE_SHA384: u16 = 0x0805;
 let RSA_PSS_RSAE_SHA512: u16 = 0x0806;
 let ED25519: u16 = 0x0807;
+let ED448: u16 = 0x0808;
+// The Brainpool curves' TLS 1.3 schemes (RFC 8734); in TLS 1.2 their keys
+// sign with the ECDSA_SECP* codes, which name only the hash there.
+let ECDSA_BRAINPOOLP256R1TLS13_SHA256: u16 = 0x081a;
+let ECDSA_BRAINPOOLP384R1TLS13_SHA384: u16 = 0x081b;
+let ECDSA_BRAINPOOLP512R1TLS13_SHA512: u16 = 0x081c;
 let MLDSA44: u16 = 0x0904;
 let MLDSA65: u16 = 0x0905;
 let MLDSA87: u16 = 0x0906;
@@ -944,7 +1063,20 @@ fn verify_scheme(c: const Cert&, scheme: u16, msg: const u8[:], sig: const u8[:]
         if c.key_type != KEY_EC_P521 { return ERR_BAD_SIGNATURE; }
         return verify_with(c, SIG_ECDSA, 512, 0, msg, sig);
     }
+    if scheme == ECDSA_BRAINPOOLP256R1TLS13_SHA256 {
+        if c.key_type != KEY_EC_BP256 { return ERR_BAD_SIGNATURE; }
+        return verify_with(c, SIG_ECDSA, 256, 0, msg, sig);
+    }
+    if scheme == ECDSA_BRAINPOOLP384R1TLS13_SHA384 {
+        if c.key_type != KEY_EC_BP384 { return ERR_BAD_SIGNATURE; }
+        return verify_with(c, SIG_ECDSA, 384, 0, msg, sig);
+    }
+    if scheme == ECDSA_BRAINPOOLP512R1TLS13_SHA512 {
+        if c.key_type != KEY_EC_BP512 { return ERR_BAD_SIGNATURE; }
+        return verify_with(c, SIG_ECDSA, 512, 0, msg, sig);
+    }
     if scheme == ED25519 { return verify_with(c, SIG_ED25519, 0, 0, msg, sig); }
+    if scheme == ED448 { return verify_with(c, SIG_ED448, 0, 0, msg, sig); }
     if scheme == MLDSA44 { return verify_with(c, SIG_MLDSA, 44, 0, msg, sig); }
     if scheme == MLDSA65 { return verify_with(c, SIG_MLDSA, 65, 0, msg, sig); }
     if scheme == MLDSA87 { return verify_with(c, SIG_MLDSA, 87, 0, msg, sig); }

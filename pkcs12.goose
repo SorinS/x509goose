@@ -83,7 +83,7 @@ fn pkcs12_kdf(h: i64, id: u8, password: const u8[:], salt: const u8[:], iteratio
             var k = v;
             while k > 0 {
                 k--;
-                let t = ib[j + k] as u32 + a[k % u] as u32 + carry;
+                let t = ib[j + k] as u32 + a[k % u] + carry;
                 ib[j + k] = t as! u8;
                 carry = t >> 8;
             }
@@ -241,7 +241,9 @@ fn pkcs12_bags(sc: const u8[:], password: const u8[:], key: u8[>..]&, nkeys: i64
 // (DER concatenated, in the file's order). OK, or ERR_MALFORMED,
 // ERR_UNSUPPORTED_ALGORITHM, ERR_BAD_SIGNATURE for a wrong password (a
 // MAC or padding that does not check out). A file with several keys is
-// refused (ERR_MALFORMED), as in Go.
+// refused (ERR_MALFORMED), as in Go; so is one without a MAC under a
+// password (ERR_BAD_SIGNATURE), since nothing then holds its contents to
+// the password: only the empty password reads such a file.
 fn pkcs12_decode(pfx: const u8[:], password: const u8[:]) -> u8[>..], u8[>..], i64 {
     var key: u8[>..] = [];
     var certs: u8[>..] = [];
@@ -258,6 +260,7 @@ fn pkcs12_decode(pfx: const u8[:], password: const u8[:]) -> u8[>..], u8[>..], i
     let os, okos = asn1::explicit(pfx, ci[1]);
     if !okos || os.tag != asn1::OCTET_STRING { return key, certs, ERR_MALFORMED; }
     let auth_safe = pfx[os.off..os.end];
+    if p.len == 2 && password.len > 0 { return key, certs, ERR_BAD_SIGNATURE; }
     if p.len == 3 {
         // MacData: SEQUENCE { DigestInfo, macSalt, iterations DEFAULT 1 }.
         let md, okmd = asn1::children_of(pfx, p[2], asn1::SEQUENCE);

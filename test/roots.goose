@@ -4,8 +4,8 @@
 // package supports (SHA-1 ones are refused as unsupported).
 import std;
 import x509 from "..";
-import asn1 from "../../asn1goose.git";
-import bignum from "../../bigmongoose.git";
+import bignum from "SorinS/bigmongoose@v0.7.0";
+import asn1 from "SorinS/asn1goose@v0.7.0";
 import x509.verify;
 
 var failures = 0;

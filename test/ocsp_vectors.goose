@@ -9,8 +9,8 @@
 // digitalSignature.
 import std;
 import x509 from "..";
-import asn1 from "../../asn1goose.git";
-import bignum from "../../bigmongoose.git";
+import bignum from "SorinS/bigmongoose@v0.7.0";
+import asn1 from "SorinS/asn1goose@v0.7.0";
 import x509.keys;
 import x509.ocsp;
 import x509.create;
@@ -112,6 +112,83 @@ fn delegated_validity(ca: const x509::Cert&, now: i64) {
           x509::ocsp_check_response(r2, leaf, ca, now) == x509::OK);
 }
 
+// A response with an extension added, to the ResponseData or to its first
+// SingleResponse, critical or not. The signature is left as it was:
+// parsing does not check it.
+fn with_ext(der: const u8[:], single: bool, critical: bool) -> u8[>..] {
+    var ext: u8[>..] = [];
+    asn1::put_oid(ext, "1.3.6.1.4.1.55555.9");
+    if critical { asn1::put_bool(ext, true); }
+    asn1::put_octets(ext, "");
+    var one: u8[>..] = [];
+    asn1::put(one, asn1::SEQUENCE, ext);
+    var seq: u8[>..] = [];
+    asn1::put(seq, asn1::SEQUENCE, one);
+    var exts: u8[>..] = [];
+    asn1::put(exts, asn1::ctx(1, true), seq);
+    // OCSPResponse { status, [0] { ResponseBytes { oid, OCTET STRING { BasicOCSPResponse } } } }
+    let top, ok = asn1::parse(der);
+    let parts, okp = asn1::children(der, top);
+    let rb, okrb = asn1::explicit(der, parts[1]);
+    let rbf, okrbf = asn1::children(der, rb);
+    let basic, okb = asn1::read(der, rbf[1].off, rbf[1].end);
+    let bf, okbf = asn1::children(der, basic);
+    let fs, okf = asn1::children(der, bf[0]);
+    assert(ok && okp && okrb && okrbf && okb && okbf && okf);
+    var data: u8[>..] = [];
+    for f in fs {
+        if single && f.tag == asn1::SEQUENCE {
+            let singles, oks = asn1::children(der, f);
+            var list: u8[>..] = [];
+            for k in singles.len {
+                if k == 0 {
+                    var sr: u8[>..] = [];
+                    sr.append(der[singles[k].off..singles[k].end]);
+                    sr.append(exts);
+                    asn1::put(list, asn1::SEQUENCE, sr);
+                } else {
+                    list.append(der[singles[k].start..singles[k].end]);
+                }
+            }
+            asn1::put(data, asn1::SEQUENCE, list);
+        } else {
+            data.append(der[f.start..f.end]);
+        }
+    }
+    if !single { data.append(exts); }
+    var b: u8[>..] = [];
+    asn1::put(b, asn1::SEQUENCE, data);
+    for k in 1..bf.len { b.append(der[bf[k].start..bf[k].end]); }
+    var bseq: u8[>..] = [];
+    asn1::put(bseq, asn1::SEQUENCE, b);
+    var rbody: u8[>..] = [];
+    rbody.append(der[rbf[0].start..rbf[0].end]);
+    asn1::put_octets(rbody, bseq);
+    var rbs: u8[>..] = [];
+    asn1::put(rbs, asn1::SEQUENCE, rbody);
+    var body: u8[>..] = [];
+    body.append(der[parts[0].start..parts[0].end]);
+    asn1::put(body, asn1::ctx(0, true), rbs);
+    var out: u8[>..] = [];
+    asn1::put(out, asn1::SEQUENCE, body);
+    return out;
+}
+
+fn critical_extensions(ca: const x509::Cert&, now: i64) {
+    let ca_key, okk = x509::parse_private_key(field("key", "ca"));
+    let leaf = load("leaf");
+    var t = x509::ocsp_template(x509::OCSP_GOOD, leaf.der[leaf.serial.off..leaf.serial.end], now);
+    let der, e = x509::ocsp_create_response(ca, ca, ca_key, t, now, false);
+    check("response for extensions", okk && e == x509::OK);
+    for single in [false, true] {
+        let r1, e1 = x509::ocsp_parse_response(with_ext(der, single, false));
+        check(if single { "single extension" } else { "response extension" }, e1 == x509::OK && r1.status == x509::OCSP_GOOD);
+        let r2, e2 = x509::ocsp_parse_response(with_ext(der, single, true));
+        check(if single { "critical single extension" } else { "critical response extension" },
+              e2 == x509::ERR_UNKNOWN_CRITICAL_EXTENSION);
+    }
+}
+
 fn main() {
     let ca = load("ca");
     let now: i64 = 1793000000;
@@ -193,6 +270,7 @@ fn main() {
     let id, okr = x509::ocsp_parse_request("\x30\x00");
     check("empty request", !okr);
     delegated_validity(ca, now);
+    critical_extensions(ca, now);
     print("ocsp vectors: ", checks, " checks, ", failures, " failed");
     assert(failures == 0);
 }

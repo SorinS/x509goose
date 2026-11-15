@@ -6,14 +6,19 @@
 // leaf outside the name constraints, a CSR, a CRL from
 // each CA (the intermediate's revokes the Ed25519 leaf), an ML-DSA-65
 // root with ML-DSA-44, ML-DSA-87 and DSA leaves, an ML-DSA CSR and CRL, a
-// DSA root with a leaf, and every leaf's private key in PKCS #8.
+// DSA root with a leaf, an SLH-DSA-SHAKE-128f root with an
+// SLH-DSA-SHA2-128f leaf, an SLH-DSA CSR and CRL, every leaf's private
+// key in PKCS #8, and paths for the rules over a whole path (as
+// test/path_rules.goose): a CA's key rollover under path length 0 and
+// another CA there, and leaves under CAs restricted to server or client
+// authentication.
 //
 //   goose tools/make_pki.goose -- <dir> <intermediate-key.der>
 import std;
 import os;
 import x509 from "..";
-import asn1 from "../../asn1goose.git";
-import bignum from "../../bigmongoose.git";
+import bignum from "SorinS/bigmongoose@v0.7.0";
+import asn1 from "SorinS/asn1goose@v0.7.0";
 import x509.keys;
 import x509.create;
 
@@ -21,6 +26,31 @@ fn save(dir: const u8[:], name: const u8[:], label: const u8[:], der: const u8[:
     var pem: u8[>..] = [];
     asn1::pem_encode(pem, label, der);
     assert(write_file(str(dir, "/", name), pem));
+}
+
+// An Ed25519 CA certificate for `key` under `issuer`, with a path length
+// constraint unless `path_len` is -1, and these extended key usages unless 0.
+fn path_ca(subject: const u8[:], key: const x509::PrivateKey&, issuer: const u8[:],
+           issuer_key: const x509::PrivateKey&, path_len: i64, eku: u32, now: i64) -> u8[>..] {
+    var t, ok = x509::template(subject, now - 3600, now + 31536000);
+    t.is_ca = true;
+    t.path_len = path_len;
+    t.key_usage = x509::KU_KEY_CERT_SIGN | x509::KU_CRL_SIGN;
+    t.ext_key_usage = eku;
+    let der, e = x509::create_certificate(t, x509::marshal_public_key(key), issuer, issuer_key);
+    assert(ok && e == x509::OK);
+    return der;
+}
+
+fn path_leaf(issuer: const u8[:], issuer_key: const x509::PrivateKey&, eku: u32, now: i64) -> u8[>..] {
+    let key = x509::generate_key(x509::KEY_ED25519);
+    var t, ok = x509::template("CN=www.example.com", now - 3600, now + 31536000);
+    t.key_usage = x509::KU_DIGITAL_SIGNATURE;
+    t.ext_key_usage = eku;
+    x509::add_dns(t.san, "www.example.com");
+    let der, e = x509::create_certificate(t, x509::marshal_public_key(key), issuer, issuer_key);
+    assert(ok && e == x509::OK);
+    return der;
 }
 
 fn main() {
@@ -97,6 +127,28 @@ fn main() {
     let bleaf, eb = x509::create_certificate(bt, x509::marshal_public_key(bk), inter, int_key);
     assert(eb == x509::OK);
     save(dir, "leaf_excluded.pem", "CERTIFICATE", bleaf);
+    // Path length 0 and a rollover: the new key's certificate is
+    // self-issued, signed by the old key; a second CA is not.
+    let old_key = x509::generate_key(x509::KEY_ED25519);
+    let new_key = x509::generate_key(x509::KEY_ED25519);
+    let old = path_ca("CN=Goose Rollover,O=Goose", old_key, root, root_key, 0, 0, now);
+    let rolled = path_ca("CN=Goose Rollover,O=Goose", new_key, old, old_key, -1, 0, now);
+    save(dir, "rollover_old.pem", "CERTIFICATE", old);
+    save(dir, "rollover_new.pem", "CERTIFICATE", rolled);
+    save(dir, "leaf_rollover.pem", "CERTIFICATE", path_leaf(rolled, new_key, x509::EKU_SERVER_AUTH, now));
+    let second_key = x509::generate_key(x509::KEY_ED25519);
+    let second = path_ca("CN=Goose Second,O=Goose", second_key, old, old_key, -1, 0, now);
+    save(dir, "second.pem", "CERTIFICATE", second);
+    save(dir, "leaf_second.pem", "CERTIFICATE", path_leaf(second, second_key, x509::EKU_SERVER_AUTH, now));
+    // Server-only leaves under a client-only CA and a server-only one.
+    let cck = x509::generate_key(x509::KEY_ED25519);
+    let client_ca = path_ca("CN=Goose Client CA,O=Goose", cck, root, root_key, -1, x509::EKU_CLIENT_AUTH, now);
+    save(dir, "client_ca.pem", "CERTIFICATE", client_ca);
+    save(dir, "leaf_disjoint.pem", "CERTIFICATE", path_leaf(client_ca, cck, x509::EKU_SERVER_AUTH, now));
+    let sck = x509::generate_key(x509::KEY_ED25519);
+    let server_ca = path_ca("CN=Goose Server CA,O=Goose", sck, root, root_key, -1, x509::EKU_SERVER_AUTH, now);
+    save(dir, "server_ca.pem", "CERTIFICATE", server_ca);
+    save(dir, "leaf_server_ca.pem", "CERTIFICATE", path_leaf(server_ca, sck, x509::EKU_SERVER_AUTH, now));
     let ck = x509::generate_key(x509::KEY_EC_P256);
     let subj, oks = x509::name_der("CN=csr.example.com,O=Requester\\, Inc.,C=US");
     var san: u8[..4096] = [];
@@ -152,5 +204,28 @@ fn main() {
     let pq_crl, epc = x509::create_crl(pq_root, pq_key, empty, now - 600, now + 86400, 1);
     assert(epc == x509::OK);
     save(dir, "crl_pq.pem", "X509 CRL", pq_crl);
+    // SLH-DSA: a SHAKE-128f root, a leaf on a SHA2-128f key, a CSR and a CRL.
+    let slh_key = x509::generate_key(x509::KEY_SLHDSA_SHAKE_128F);
+    var st, okst = x509::template("CN=Goose Made SLH-DSA Root,O=Goose", now - 3600, now + 10 * year);
+    st.is_ca = true;
+    st.key_usage = x509::KU_KEY_CERT_SIGN | x509::KU_CRL_SIGN;
+    let slh_root, esr = x509::create_certificate(st, x509::marshal_public_key(slh_key), "", slh_key);
+    assert(esr == x509::OK);
+    save(dir, "slh_root.pem", "CERTIFICATE", slh_root);
+    let slh_leaf_key = x509::generate_key(x509::KEY_SLHDSA_SHA2_128F);
+    var slt, okslt = x509::template("CN=www.example.com,O=Goose", now - 3600, now + year);
+    slt.key_usage = x509::KU_DIGITAL_SIGNATURE;
+    slt.ext_key_usage = x509::EKU_SERVER_AUTH;
+    x509::add_dns(slt.san, "www.example.com");
+    let slh_leaf, esl = x509::create_certificate(slt, x509::marshal_public_key(slh_leaf_key), slh_root, slh_key);
+    assert(esl == x509::OK);
+    save(dir, "leaf_slhdsa.pem", "CERTIFICATE", slh_leaf);
+    save(dir, "leaf_slhdsa.key", "PRIVATE KEY", x509::marshal_pkcs8(slh_leaf_key));
+    let csr_slh, ecsr_slh = x509::create_csr(subj, san, slh_leaf_key);
+    assert(ecsr_slh == x509::OK);
+    save(dir, "csr_slhdsa.pem", "CERTIFICATE REQUEST", csr_slh);
+    let slh_crl, escrl = x509::create_crl(slh_root, slh_key, empty, now - 600, now + 86400, 1);
+    assert(escrl == x509::OK);
+    save(dir, "crl_slhdsa.pem", "X509 CRL", slh_crl);
     print("ok");
 }

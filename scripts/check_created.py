@@ -8,8 +8,12 @@ refuse the leaf outside the intermediate's name constraints, verify the
 CSR's signature and both CRLs, find the revoked leaf revoked under
 -crl_check_all and the others not, and read every private key, whose
 public key must be the one in its certificate; the same for the ML-DSA
-and DSA hierarchy. Go's crypto/x509 (tools/govectors `check`) must
-verify the ML-DSA leaves and read their PKCS #8 keys.
+and DSA hierarchy and the SLH-DSA one (root, leaf, CSR, CRL); and the
+rules over a whole path: a CA's key rollover within path length 0 and
+another CA beyond it, a server-only leaf under a client-only CA refused
+for both purposes and under a server-only one accepted. Go's crypto/x509
+(tools/govectors `check`) must verify the ML-DSA leaves and read their
+PKCS #8 keys.
 
     python3 scripts/check_created.py [--goose PATH]
 """
@@ -85,6 +89,35 @@ def main():
                                                           f("leaf_mldsa44.pem")), False)
     expect("ML-DSA csr signature", ossl("req", "-in", f("csr_mldsa.pem"), "-verify", "-noout"), True, "verify OK")
     expect("ML-DSA crl", ossl("crl", "-in", f("crl_pq.pem"), "-CAfile", f("pq_root.pem"), "-noout"), True, "verify OK")
+    # SLH-DSA (Go has none, so openssl alone).
+    expect("leaf_slhdsa verifies", ossl("verify", "-x509_strict", "-purpose", "sslserver", "-CAfile", f("slh_root.pem"),
+                                        "-verify_hostname", "www.example.com", f("leaf_slhdsa.pem")), True)
+    pub_cert = ossl("x509", "-in", f("leaf_slhdsa.pem"), "-noout", "-pubkey").stdout
+    pub_key = ossl("pkey", "-in", f("leaf_slhdsa.key"), "-pubout").stdout
+    results.append(pub_cert == pub_key and pub_cert != "")
+    print(("ok    " if results[-1] else "FAIL  ") + "leaf_slhdsa key matches certificate")
+    expect("SLH-DSA leaf under the ML-DSA root refused", ossl("verify", "-CAfile", f("pq_root.pem"),
+                                                              f("leaf_slhdsa.pem")), False)
+    expect("SLH-DSA csr signature", ossl("req", "-in", f("csr_slhdsa.pem"), "-verify", "-noout"), True, "verify OK")
+    expect("SLH-DSA crl", ossl("crl", "-in", f("crl_slhdsa.pem"), "-CAfile", f("slh_root.pem"), "-noout"), True,
+           "verify OK")
+    # The rules over a whole path: a self-issued rollover does not count
+    # against path length 0, another CA does; a server-only leaf under a
+    # client-only CA is good for neither purpose, under a server-only one
+    # for serving.
+    with open(f("rollover.pem"), "w") as out:
+        out.write(open(f("rollover_old.pem")).read() + open(f("rollover_new.pem")).read())
+    with open(f("second_path.pem"), "w") as out:
+        out.write(open(f("rollover_old.pem")).read() + open(f("second.pem")).read())
+    path = lambda purpose, untrusted, leaf: ossl("verify", "-x509_strict", "-purpose", purpose, "-CAfile", f("root.pem"),
+                                                 "-untrusted", f(untrusted), f(leaf))
+    expect("rollover within path length 0", path("sslserver", "rollover.pem", "leaf_rollover.pem"), True)
+    expect("second CA beyond path length 0", path("sslserver", "second_path.pem", "leaf_second.pem"), False,
+           "path length constraint exceeded")
+    for purpose in ("sslserver", "sslclient"):
+        expect(f"server leaf under a client CA refused as {purpose}", path(purpose, "client_ca.pem", "leaf_disjoint.pem"),
+               False, "unsuitable certificate purpose")
+    expect("server leaf under a server CA", path("sslserver", "server_ca.pem", "leaf_server_ca.pem"), True)
     # Go's crypto/x509 too, for the ML-DSA certificates (it checks no DSA signatures).
     go = subprocess.run([os.path.join(ROOT, "tools", "govectors.sh"), "check", d], capture_output=True, text=True)
     expect("Go verifies the ML-DSA leaves and reads their keys", go, True, "ok")

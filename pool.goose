@@ -4,9 +4,11 @@
 // them from PEM or DER files, from a directory, and from the system's
 // root store (SystemCertPool).
 //
-// A pool keeps the DER of its certificates back to back, each once (a
-// certificate added again is ignored), with an index entry each: where it
-// is, and hashes of its subject, its key identifier and its whole DER.
+// A pool keeps its certificates back to back in one growable buffer, each
+// once (a certificate added again is ignored), each after a header of four
+// little-endian u32s: hashes of its subject, its key identifier and its
+// whole DER, and the DER's length. An empty pool takes no room, and a pool
+// grows with what it holds; lookups walk the headers.
 
 namespace x509;
 
@@ -15,35 +17,54 @@ import os;
 import x509;
 import asn1;
 
-let POOL_MAX: i64 = 4096;
+// A header's size and its fields' offsets.
+let POOL_HEADER: i64 = 16;
+let PH_SUBJECT:  i64 = 0;
+let PH_KEY_ID:   i64 = 4; // 0 without a subjectKeyIdentifier
+let PH_WHOLE:    i64 = 8;
+let PH_LEN:      i64 = 12;
 
 struct CertPool {
-    n: i64,
-    start: u32[..4096], end: u32[..4096],   // the certificate's bytes in der
-    subject: u32[..4096],                   // hash of the subject Name's DER
-    key_id: u32[..4096],                    // hash of the subjectKeyIdentifier, 0 without one
-    whole: u32[..4096],                     // hash of the certificate's DER
-    der: u8[>..],
+    n:    i64,
+    data: u8[>..],   // headers and DER, one certificate after another
 }
 
-fn new_pool() -> CertPool {
-    CertPool { n: 0, start: [], end: [], subject: [], key_id: [], whole: [], der: [] }
-}
+fn new_pool() -> CertPool { CertPool { n: 0, data: [] } }
 
 fn pool_hash(b: const u8[:]) -> u32 { hash(b) as! u32 }
 
 fn pool_len(p: const CertPool&) -> i64 { p.n }
 
+fn pool_u32(p: const CertPool&, off: i64) -> u32 {
+    p.data[off] | (p.data[off + 1] as u32) << 8 | (p.data[off + 2] as u32) << 16 | (p.data[off + 3] as u32) << 24
+}
+
+fn pool_put_u32(p: CertPool&, v: u32) {
+    for k in 4 { p.data.push((v >> (8 * k) as u32) as! u8); }
+}
+
+// Where the header after the one at off is.
+fn pool_next(p: const CertPool&, off: i64) -> i64 { off + POOL_HEADER + pool_u32(p, off + PH_LEN) }
+
+fn pool_der_at(p: const CertPool&, off: i64) -> const u8[:] { p.data[off + POOL_HEADER..pool_next(p, off)] }
+
+// Where the i-th certificate's header is.
+fn pool_at(p: const CertPool&, i: i64) -> i64 {
+    var off = 0;
+    for k in i { off = pool_next(p, off); }
+    return off;
+}
+
 // The DER of the i-th certificate, in the order they were added.
 fn pool_der(p: const CertPool&, i: i64) -> u8[>..] {
     var out: u8[>..] = [];
-    out.append(p.der[(p.start[i] as i64)..(p.end[i] as i64)]);
+    out.append(pool_der_at(p, pool_at(p, i)));
     return out;
 }
 
 // The i-th certificate, parsed.
 fn pool_cert(p: const CertPool&, i: i64) -> Cert {
-    let c, e = parse(p.der[(p.start[i] as i64)..(p.end[i] as i64)]);
+    let c, e = parse(pool_der_at(p, pool_at(p, i)));
     assert(e == OK);
     return c;
 }
@@ -51,8 +72,10 @@ fn pool_cert(p: const CertPool&, i: i64) -> Cert {
 // The index of a certificate in the pool, or -1.
 fn pool_find(p: const CertPool&, der: const u8[:]) -> i64 {
     let h = pool_hash(der);
+    var off = 0;
     for i in p.n {
-        if p.whole[i] == h && p.der[(p.start[i] as i64)..(p.end[i] as i64)] == der { return i; }
+        if pool_u32(p, off + PH_WHOLE) == h && pool_der_at(p, off) == der { return i; }
+        off = pool_next(p, off);
     }
     return -1;
 }
@@ -60,17 +83,16 @@ fn pool_find(p: const CertPool&, der: const u8[:]) -> i64 {
 fn pool_contains(p: const CertPool&, der: const u8[:]) -> bool { pool_find(p, der) >= 0 }
 
 // Adds a parsed certificate (AddCert); true if it is in the pool
-// afterwards, false if the pool is full.
+// afterwards, false if it is too large for its header.
 fn pool_add_cert(p: CertPool&, c: const Cert&) -> bool {
     let d = c.der[..];
     if pool_contains(p, d) { return true; }
-    if p.n == POOL_MAX || p.der.len + d.len > 0xffffffff { return false; }
-    p.start.push(p.der.len as! u32);
-    p.der.append(d);
-    p.end.push(p.der.len as! u32);
-    p.subject.push(pool_hash(d[c.subject.start..c.subject.end]));
-    p.key_id.push(if c.ski.end > c.ski.start { pool_hash(d[c.ski.off..c.ski.end]) } else { 0 });
-    p.whole.push(pool_hash(d));
+    if d.len > 0xffffffff { return false; }
+    pool_put_u32(p, pool_hash(d[c.subject.start..c.subject.end]));
+    pool_put_u32(p, if c.ski.end > c.ski.start { pool_hash(d[c.ski.off..c.ski.end]) } else { 0 });
+    pool_put_u32(p, pool_hash(d));
+    pool_put_u32(p, d.len as! u32);
+    p.data.append(d);
     p.n++;
     return true;
 }
@@ -105,7 +127,11 @@ fn pool_of(list: const u8[:]) -> CertPool, bool {
 // The certificates of a pool, DER concatenated.
 fn pool_concatenated(p: const CertPool&) -> u8[>..] {
     var out: u8[>..] = [];
-    for i in p.n { out.append(p.der[(p.start[i] as i64)..(p.end[i] as i64)]); }
+    var off = 0;
+    for i in p.n {
+        out.append(pool_der_at(p, off));
+        off = pool_next(p, off);
+    }
     return out;
 }
 
@@ -181,11 +207,14 @@ fn pool_issuers(p: const CertPool&, c: const Cert&) -> i64[>..] {
     let aki = d[c.aki.off..c.aki.end];
     let hk = if has_aki { pool_hash(aki) } else { 0 };
     for pass in 2 {
+        var off = 0;
         for i in p.n {
-            if p.subject[i] != h { continue; }
-            let cand = pool_cert(p, i);
-            if cand.der[cand.subject.start..cand.subject.end] != name { continue; }
-            let key_match = has_aki && p.key_id[i] == hk && cand.der[cand.ski.off..cand.ski.end] == aki;
+            let at = off;
+            off = pool_next(p, off);
+            if pool_u32(p, at + PH_SUBJECT) != h { continue; }
+            let cand, e = parse(pool_der_at(p, at));
+            if e != OK || cand.der[cand.subject.start..cand.subject.end] != name { continue; }
+            let key_match = has_aki && pool_u32(p, at + PH_KEY_ID) == hk && cand.der[cand.ski.off..cand.ski.end] == aki;
             if (pass == 0) == key_match { out.push(i); }
         }
     }
@@ -245,7 +274,7 @@ fn load_system_roots() -> CertPool, bool {
 
 var SYSTEM_ROOTS_LOADED = false;
 var SYSTEM_ROOTS_OK = false;
-var SYSTEM_ROOTS = CertPool { n: 0, start: [], end: [], subject: [], key_id: [], whole: [], der: [] };
+var SYSTEM_ROOTS = CertPool { n: 0, data: [] };
 
 // The system's roots (SystemCertPool): loaded the first time, then a copy
 // of what was loaded, which the caller may add to.

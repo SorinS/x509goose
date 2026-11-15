@@ -8,3 +8,6 @@ test/*
 *.c
 __pycache__/
 __pycache__/
+!test/cms_smime/
+!examples/*.pem
+!examples/*.p12

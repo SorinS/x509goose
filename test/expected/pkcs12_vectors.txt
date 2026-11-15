@@ -1,1 +1,1 @@
-pkcs12 vectors: 218 checks, 0 failed
+pkcs12 vectors: 206 checks, 0 failed

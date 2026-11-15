@@ -21,25 +21,28 @@ fn check_common(c: const Cert&, now: i64) -> i64 {
     return OK;
 }
 
-// Whether a certificate's extended key usage, if it has one, allows one of
-// the usages wanted (EKU_* masks).
-fn eku_allows(c: const Cert&, wanted: u32) -> bool {
-    if wanted & EKU_ANY != 0 || !c.has_ext_key_usage { return true; }
-    return c.ext_key_usage & (wanted | EKU_ANY) != 0;
+// Of the usages wanted (EKU_* masks, any one of which will do), those a
+// certificate's extended key usage allows: all of them if it has none or
+// allows any usage, or if EKU_ANY is wanted. A path is good for the
+// usages that survive every certificate on it.
+fn eku_surviving(c: const Cert&, wanted: u32) -> u32 {
+    if wanted & EKU_ANY != 0 || !c.has_ext_key_usage || c.ext_key_usage & EKU_ANY != 0 { return wanted; }
+    return wanted & c.ext_key_usage;
 }
 
-// Checks on a certificate that issues the one below it, `below` CA
-// certificates (not counting the leaf) further down the path, for the
-// extended key usages wanted.
+// Checks on a certificate that issues the one below it, `below`
+// non-self-issued CA certificates (not counting the leaf) further down the
+// path (RFC 5280 §4.2.1.9), for the extended key usages that survive the
+// path below it.
 fn check_issuer(c: const Cert&, now: i64, below: i64, wanted: u32) -> i64 {
     let e = check_common(c, now);
     if e != OK { return e; }
     if !c.has_basic_constraints || !c.is_ca { return ERR_NOT_CA; }
     if c.path_len >= 0 && below > c.path_len { return ERR_PATH_LENGTH; }
     if c.has_key_usage && c.key_usage & KU_KEY_CERT_SIGN == 0 { return ERR_KEY_USAGE; }
-    // A CA restricted by extended key usage must allow the usage wanted (as
-    // Go, Chrome and Firefox require).
-    if !eku_allows(c, wanted) { return ERR_EXTENDED_KEY_USAGE; }
+    // A CA restricted by extended key usage must allow a usage wanted that
+    // the path below allows too (as Go, Chrome and Firefox require).
+    if eku_surviving(c, wanted) == 0 { return ERR_EXTENDED_KEY_USAGE; }
     return OK;
 }
 
@@ -66,6 +69,13 @@ fn same_identity(a: const Cert&, b: const Cert&) -> bool {
     a.der[a.subject.start..a.subject.end] == b.der[b.subject.start..b.subject.end]
         && a.der[a.spki.start..a.spki.end] == b.der[b.spki.start..b.spki.end]
         && a.has_san == b.has_san && a.der[a.san.start..a.san.end] == b.der[b.san.start..b.san.end]
+}
+
+// The error to report of two met in a path search, each with how close
+// its path came (verify_pools); of equals, the later.
+fn closer(best: i64, best_rank: i64, e: i64, rank: i64) -> i64, i64 {
+    if rank >= best_rank { return e, rank; }
+    return best, best_rank;
 }
 
 // The checks that need the whole path, given top-down as `chain` (n
@@ -168,23 +178,28 @@ fn verify_client_with_system_roots(leaf_der: const u8[:], intermediates: const u
 // Validates a TLS server certificate (Go's Certificate.Verify): a path from
 // `leaf` through any of `intermediates` to one of `roots`, every link
 // signed by the next, all of them valid at `now` (seconds since 1970), the
-// CAs allowed to issue, the leaf and CAs allowed for the options' extended
-// key usages (server authentication by default), the leaf
-// valid for `host` (no check when host is empty), every name within the
+// CAs allowed to issue, one of the options' extended key usages (server
+// authentication by default) allowed by the leaf and every CA above it,
+// the leaf valid for `host` (no check when host is empty), every name within the
 // name constraints above it, an acceptable policy when the path or the
 // options require one, and, when the options ask, a usable CRL among
 // `crls` (DER CRLs concatenated) that does not list the certificates
 // checked. The roots' own signatures and dates are not checked, only
 // their keys and constraints, as trust anchors are. Issuers are looked up
 // by name in the pools, those with the matching key identifier first.
-// Returns OK or the error of the path that came closest.
+// Returns OK or the error of the path that came closest: the longest
+// path whose signatures verified, and at its top a failed check on the
+// whole path before an issuer that is not a CA (or is expired, and so
+// on), and that before a bad signature, likely just another CA of the
+// same name.
 fn verify_pools(leaf_der: const u8[:], intermediates: const CertPool&, roots: const CertPool&,
                 crls: const u8[:], now: i64, host: const u8[:], opts: const Options&) -> i64 {
     let leaf, e = parse(leaf_der);
     if e != OK { return e; }
     let le = check_common(leaf, now);
     if le != OK { return le; }
-    if !eku_allows(leaf, opts.key_usages) { return ERR_EXTENDED_KEY_USAGE; }
+    let leaf_usages = eku_surviving(leaf, opts.key_usages);
+    if leaf_usages == 0 { return ERR_EXTENDED_KEY_USAGE; }
     if leaf.has_key_usage && leaf.key_usage & (KU_DIGITAL_SIGNATURE | KU_KEY_ENCIPHERMENT | KU_KEY_AGREEMENT) == 0 {
         return ERR_KEY_USAGE;
     }
@@ -194,30 +209,41 @@ fn verify_pools(leaf_der: const u8[:], intermediates: const CertPool&, roots: co
     // Depth-first search. path[i] is the index in `intermediates` of the
     // i-th certificate above the leaf; tried[i] is how many of the
     // candidates for the next one up have been tried.
-    var path: i64[>..<] = [];
+    var path:  i64[>..<] = [];
     var tried: i64[>..<] = [0];
     var best = ERR_UNKNOWN_ISSUER;
+    var best_rank = -1;
     var sigs = 0;
     loop {
         let depth = path.len;
         // The certificate at the top of the path so far.
         var top = empty_cert();
         if depth == 0 { top = copy(leaf); } else { top = pool_cert(intermediates, path[depth - 1]); }
+        // The usages wanted that the path so far allows, and its
+        // intermediates that count against a path length constraint: not
+        // the self-issued ones (a CA's key rollover, say).
+        var usages = leaf_usages;
+        var below = 0;
+        for p in path {
+            let pc = pool_cert(intermediates, p);
+            usages = eku_surviving(pc, usages);
+            if !self_issued(pc) { below++; }
+        }
         // A root that issued it ends the search, if the whole path holds;
         // tried once per certificate on the path.
         if tried[depth] == 0 {
             for ri in pool_issuers(roots, top) {
                 let root = pool_cert(roots, ri);
-                let ce = check_issuer(root, now, depth, opts.key_usages);
+                let ce = check_issuer(root, now, below, usages);
                 // A root without basicConstraints is accepted if it is
                 // self-issued (a v1 root); otherwise roots are held to the
                 // same rules as any CA.
                 let ok_root = ce == OK || (ce == ERR_NOT_CA && !root.has_basic_constraints && self_issued(root));
-                if !ok_root { best = ce; continue; }
+                if !ok_root { best, best_rank = closer(best, best_rank, ce, 3 * depth + 1); continue; }
                 if sigs == MAX_SIGNATURE_CHECKS { return ERR_TOO_MANY_SIGNATURES; }
                 sigs++;
                 let se = check_signature(top, root);
-                if se != OK { best = se; continue; }
+                if se != OK { best, best_rank = closer(best, best_rank, se, 3 * depth); continue; }
                 var chain: u8[>..] = [];
                 var k = depth;
                 while k > 0 {
@@ -227,7 +253,7 @@ fn verify_pools(leaf_der: const u8[:], intermediates: const CertPool&, roots: co
                 chain.append(leaf_der);
                 let pe = check_path(root, chain, depth + 1, crls, now, opts);
                 if pe == OK { return OK; }
-                best = pe;
+                best, best_rank = closer(best, best_rank, pe, 3 * depth + 2);
             }
         }
         // Otherwise an intermediate that issued it, not already on the path.
@@ -247,12 +273,12 @@ fn verify_pools(leaf_der: const u8[:], intermediates: const CertPool&, roots: co
                     on_path = same_identity(cand, pc);
                 }
                 if on_path { continue; }
-                let ce = check_issuer(cand, now, depth, opts.key_usages);
-                if ce != OK { best = ce; continue; }
+                let ce = check_issuer(cand, now, below, usages);
+                if ce != OK { best, best_rank = closer(best, best_rank, ce, 3 * depth + 1); continue; }
                 if sigs == MAX_SIGNATURE_CHECKS { return ERR_TOO_MANY_SIGNATURES; }
                 sigs++;
                 let se = check_signature(top, cand);
-                if se != OK { best = se; continue; }
+                if se != OK { best, best_rank = closer(best, best_rank, se, 3 * depth); continue; }
                 path.push(here);
                 tried.push(0);
                 found = true;
@@ -260,7 +286,7 @@ fn verify_pools(leaf_der: const u8[:], intermediates: const CertPool&, roots: co
             }
             tried[depth] = ::max(ci, 1);
         } else {
-            best = ERR_CHAIN_TOO_LONG;
+            best, best_rank = closer(best, best_rank, ERR_CHAIN_TOO_LONG, 3 * depth + 1);
         }
         if found { continue; }
         // A dead end: back up one level.

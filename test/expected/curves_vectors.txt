@@ -1,0 +1,2 @@
+12 certificates, 6 path cases, 15 CMS
+curves keys, certificates and CMS: 280 checks, 0 failed

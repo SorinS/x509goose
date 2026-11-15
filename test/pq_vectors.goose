@@ -1,15 +1,21 @@
-// ML-DSA and DSA keys and certificates against vectors/pq.txt
-// (scripts/pq_vectors.py): openssl's keys must parse from each PKCS #8
+// ML-DSA, SLH-DSA and DSA keys and certificates against vectors/pq.txt
+// and vectors/pq_slhdsa.txt (scripts/pq_vectors.py): openssl's keys must
+// parse from each PKCS #8
 // form (the expanded key alone refused, as Go refuses it), marshal back to
 // openssl's seed-only PKCS #8 (and DSA's) and SubjectPublicKeyInfo, and
 // Go's keys to Go's bytes; certificates made by openssl and by Go must
 // parse and their path cases give the result openssl or Go gave; and each
 // key must sign a certificate here that checks, and TLS signatures under
-// its scheme.
+// its scheme. SLH-DSA: openssl's keys of all twelve sets must parse and
+// marshal back to its PKCS #8 and SubjectPublicKeyInfo byte for byte, its
+// hierarchies signed with the "s" sets must check, and keys of the "f" sets
+// (made by openssl and here) sign certificates that check;
+// SLH-DSA has no TLS SignatureScheme.
 import std;
 import x509 from "..";
-import asn1 from "../../asn1goose.git";
-import bignum from "../../bigmongoose.git";
+import bignum from "SorinS/bigmongoose@v0.7.0";
+import asn1 from "SorinS/asn1goose@v0.7.0";
+import bignum.slhdsa;
 import x509.keys;
 import x509.create;
 import x509.verify;
@@ -36,9 +42,14 @@ fn unhex(s: const u8[:]) -> u8[>..] {
 }
 
 fn vectors() -> const u8[:] { embed_file("vectors/pq.txt") }
+fn slh_vectors() -> const u8[:] { embed_file("vectors/pq_slhdsa.txt") }
 
 fn cert_der(name: const u8[:]) -> u8[>..] {
     for line in split(vectors(), '\n') {
+        let w = words(line);
+        if w.len == 3 && w[0] == "cert" && w[1] == name { return unhex(w[2]); }
+    }
+    for line in split(slh_vectors(), '\n') {
         let w = words(line);
         if w.len == 3 && w[0] == "cert" && w[1] == name { return unhex(w[2]); }
     }
@@ -90,10 +101,12 @@ fn sign_checks(label: const u8[:], k: const x509::PrivateKey&, scheme: u16, wron
 
 fn scheme_of(set: i64) -> u16 { x509::mldsa_scheme(set) }
 
-fn main() {
-    var certs = 0;
-    var cases = 0;
-    for line in split(vectors(), '\n') {
+// An SLH-DSA set signed with here: the "f" ones (an "s" set takes seconds
+// to sign; bignum's tests sign two of them).
+fn slh_signed_here(set: i64) -> bool { set % 2 == 0 }
+
+fn run(text: const u8[:], certs: i64&, cases: i64&) {
+    for line in split(text, '\n') {
         let w = words(line);
         if w.len == 0 { continue; }
         let label = line[..::min(line.len, 24)];
@@ -117,6 +130,25 @@ fn main() {
             let ke, oke = x509::parse_private_key(expanded);
             check(str(label, " expanded key alone refused"), !oke);
             sign_checks(label, k, scheme_of(set), if set == 44 { x509::MLDSA65 } else { x509::MLDSA44 });
+        } else if w[0] == "slhkey" {
+            let set, oks = parse_int(w[1], 10);
+            let pkcs8 = unhex(w[2]);
+            let spki = unhex(w[3]);
+            let k, ok = x509::parse_private_key(pkcs8);
+            check(str(label, " parses"), ok && k.kind == x509::slhdsa_kind(set) && x509::is_slhdsa(k.kind) &&
+                  k.slh.len == bignum::slhdsa_sk_len(set));
+            check(str(label, " PKCS #8 back"), x509::marshal_pkcs8(k) == pkcs8);
+            check(str(label, " SPKI"), x509::marshal_public_key(k) == spki);
+            // A key a byte short, and one of another set's length, are refused.
+            var short = k;
+            short.slh.pop();
+            let ks, oks2 = x509::parse_private_key(x509::marshal_pkcs8(short));
+            check(str(label, " short key refused"), !oks2);
+            var other = k;
+            other.kind = x509::slhdsa_kind(if bignum::slhdsa_n(set) == 16 { set + 2 } else { set - 2 });
+            let ko, oko = x509::parse_private_key(x509::marshal_pkcs8(other));
+            check(str(label, " key under another set's OID refused"), !oko);
+            if slh_signed_here(set) { sign_checks(label, k, 0, 0); }
         } else if w[0] == "gokey" {
             let set, oks = parse_int(w[1], 10);
             let seed = unhex(w[2]);
@@ -143,7 +175,7 @@ fn main() {
             sign_checks(label, k, 0, 0);
         } else if w[0] == "cert" {
             let c, e = x509::parse(unhex(w[2]));
-            let pq_sig = c.sig_alg == x509::SIG_MLDSA || c.sig_alg == x509::SIG_DSA;
+            let pq_sig = c.sig_alg == x509::SIG_MLDSA || c.sig_alg == x509::SIG_DSA || c.sig_alg == x509::SIG_SLHDSA;
             check(str(label, " parses"), e == x509::OK && pq_sig && c.key_type != x509::KEY_UNKNOWN);
             certs++;
         } else if w[0] == "case" {
@@ -159,12 +191,27 @@ fn main() {
             cases++;
         }
     }
+}
+
+fn main() {
+    var certs = 0;
+    var cases = 0;
+    run(vectors(), certs, cases);
+    run(slh_vectors(), certs, cases);
     // Keys made here.
     for kind in [x509::KEY_MLDSA44, x509::KEY_MLDSA65, x509::KEY_MLDSA87] {
         let k = x509::generate_key(kind);
         let back, ok = x509::parse_private_key(x509::marshal_pkcs8(k));
         check("generated ML-DSA key round trip", ok && back.kind == kind && back.seed == k.seed);
         sign_checks("generated", k, scheme_of(x509::mldsa_set(kind)), x509::ED25519);
+    }
+    for set in [bignum::SLHDSA_SHA2_128F, bignum::SLHDSA_SHAKE_192F] {
+        let kind = x509::slhdsa_kind(set);
+        let k = x509::generate_key(kind);
+        let back, ok = x509::parse_private_key(x509::marshal_pkcs8(k));
+        check("generated SLH-DSA key round trip", ok && back.kind == kind && back.slh == k.slh &&
+              bignum::slhdsa_check_key(set, k.slh));
+        sign_checks("generated SLH-DSA", k, 0, 0);
     }
     print(certs, " certificates, ", cases, " path cases");
     print("pq keys and certificates: ", checks, " checks, ", failures, " failed");

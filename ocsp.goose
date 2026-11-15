@@ -169,12 +169,35 @@ fn ocsp_generalized_time(d: const u8[:], t: asn1::Tlv) -> i64, bool {
     return asn1::read_time(d, t);
 }
 
-// One SingleResponse into r; false if malformed.
-fn ocsp_read_single(r: OcspResponse&, d: const u8[:], t: asn1::Tlv) -> bool {
+// Extensions under an [1] EXPLICIT: OK, ERR_MALFORMED, or
+// ERR_UNKNOWN_CRITICAL_EXTENSION for a critical one, none of which this
+// package implements in responses.
+fn ocsp_extensions(d: const u8[:], t: asn1::Tlv) -> i64 {
+    let w, okw = asn1::explicit(d, t);
+    let exts, oke = asn1::children_of(d, w, asn1::SEQUENCE);
+    if !okw || !oke || exts.len == 0 { return ERR_MALFORMED; }
+    var critical = false;
+    for x in exts {
+        let f, okf = asn1::children_of(d, x, asn1::SEQUENCE);
+        if !okf || f.len < 2 || f.len > 3 || f[0].tag != asn1::OID || f[f.len - 1].tag != asn1::OCTET_STRING {
+            return ERR_MALFORMED;
+        }
+        if f.len == 3 {
+            let v, okv = asn1::read_bool(d, f[1]);
+            if !okv || !v { return ERR_MALFORMED; }          // DER leaves FALSE out
+            critical = true;
+        }
+    }
+    return if critical { ERR_UNKNOWN_CRITICAL_EXTENSION } else { OK };
+}
+
+// One SingleResponse into r: OK, ERR_MALFORMED, or
+// ERR_UNKNOWN_CRITICAL_EXTENSION.
+fn ocsp_read_single(r: OcspResponse&, d: const u8[:], t: asn1::Tlv) -> i64 {
     let fs, ok = asn1::children_of(d, t, asn1::SEQUENCE);
-    if !ok || fs.len < 3 { return false; }
+    if !ok || fs.len < 3 { return ERR_MALFORMED; }
     let id, okid = ocsp_read_cert_id(d, fs[0]);
-    if !okid { return false; }
+    if !okid { return ERR_MALFORMED; }
     r.id = id;
     let st = fs[1];
     r.revoked_at = -1;
@@ -184,39 +207,45 @@ fn ocsp_read_single(r: OcspResponse&, d: const u8[:], t: asn1::Tlv) -> bool {
     else if st.tag == asn1::ctx(1, true) {
         r.status = OCSP_REVOKED;
         let ri, okri = asn1::children(d, st);
-        if !okri || ri.len < 1 || ri.len > 2 { return false; }
+        if !okri || ri.len < 1 || ri.len > 2 { return ERR_MALFORMED; }
         let at, okat = ocsp_generalized_time(d, ri[0]);
-        if !okat { return false; }
+        if !okat { return ERR_MALFORMED; }
         r.revoked_at = at;
         if ri.len == 2 {
-            if ri[1].tag != asn1::ctx(0, true) { return false; }
+            if ri[1].tag != asn1::ctx(0, true) { return ERR_MALFORMED; }
             let e, oke = asn1::explicit(d, ri[1]);
             let reason, okr = asn1::read_i64(d, e, asn1::ENUMERATED);
-            if !oke || !okr || reason < 0 || reason > 10 || reason == 7 { return false; }
+            if !oke || !okr || reason < 0 || reason > 10 || reason == 7 { return ERR_MALFORMED; }
             r.reason = reason;
         }
-    } else { return false; }
+    } else { return ERR_MALFORMED; }
     let tu, oktu = ocsp_generalized_time(d, fs[2]);
-    if !oktu { return false; }
+    if !oktu { return ERR_MALFORMED; }
     r.this_update = tu;
     r.next_update = -1;
     var i = 3;
     if i < fs.len && fs[i].tag == asn1::ctx(0, true) {
         let e, oke = asn1::explicit(d, fs[i]);
         let nu, oknu = ocsp_generalized_time(d, e);
-        if !oke || !oknu { return false; }
+        if !oke || !oknu { return ERR_MALFORMED; }
         r.next_update = nu;
         i++;
     }
-    if i < fs.len && fs[i].tag == asn1::ctx(1, true) { i++; }
-    return i == fs.len;
+    if i < fs.len && fs[i].tag == asn1::ctx(1, true) {
+        let e = ocsp_extensions(d, fs[i]);
+        if e != OK { return e; }
+        i++;
+    }
+    return if i == fs.len { OK } else { ERR_MALFORMED };
 }
 
 // ParseResponse: the response's structure, and its answer for the
 // certificate with the serial number (INTEGER content) given, or with no
 // serial its only answer. No signature or time is checked here (see
-// ocsp_check_response). OK and the response, or ERR_MALFORMED; an
-// unsuccessful status parses with OK and response_status set.
+// ocsp_check_response). OK and the response, or ERR_MALFORMED, or
+// ERR_UNKNOWN_CRITICAL_EXTENSION for a critical response or single
+// extension (none is implemented); an unsuccessful status parses with OK
+// and response_status set.
 fn ocsp_parse_response(der: const u8[:], serial: const u8[:] = "") -> OcspResponse, i64 {
     var r = ocsp_empty_response();
     r.der.append(der);
@@ -275,11 +304,16 @@ fn ocsp_parse_response(der: const u8[:], serial: const u8[:] = "") -> OcspRespon
     let singles, oks = asn1::children_of(d, fs[i + 2], asn1::SEQUENCE);
     if !oks || singles.len == 0 { return r, ERR_MALFORMED; }
     i += 3;
-    if i < fs.len && fs[i].tag == asn1::ctx(1, true) { i++; }
+    if i < fs.len && fs[i].tag == asn1::ctx(1, true) {
+        let e = ocsp_extensions(d, fs[i]);
+        if e != OK { return r, e; }
+        i++;
+    }
     if i != fs.len { return r, ERR_MALFORMED; }
     if serial.len == 0 && singles.len != 1 { return r, ERR_MALFORMED; }
     for s in singles {
-        if !ocsp_read_single(r, d, s) { return r, ERR_MALFORMED; }
+        let e = ocsp_read_single(r, d, s);
+        if e != OK { return r, e; }
         if serial.len == 0 || r.id.serial == serial { return r, OK; }
     }
     return r, ERR_REVOCATION_UNKNOWN;                       // no answer for that certificate
@@ -392,7 +426,6 @@ fn ocsp_put_gtime(out: u8[>..]&, unix: i64) {
 // reason of 0 (unspecified) left out.
 fn ocsp_create_response(issuer: const Cert&, responder: const Cert&, key: const PrivateKey&, t: const OcspTemplate&,
                         produced_at: i64, include_cert: bool) -> u8[>..], i64 {
-    var none: u8[>..] = [];
     var alg = t.sig_alg;
     var h = t.sig_hash;
     if alg == 0 {
@@ -400,12 +433,12 @@ fn ocsp_create_response(issuer: const Cert&, responder: const Cert&, key: const 
         alg = a;
         h = hh;
     }
-    if !sig_fits_key(key.kind, alg, h) { return none, ERR_UNSUPPORTED_ALGORITHM; }
+    if !sig_fits_key(key.kind, alg, h) { return [], ERR_UNSUPPORTED_ALGORITHM; }
     var id = OcspCertId { hash: t.hash, name_hash: [], key_hash: [], serial: [] };
     let d = issuer.der[..];
     id.name_hash.append(bignum::hash_bits(t.hash, d[issuer.subject.start..issuer.subject.end]));
     let kb, okk = key_bytes(d, issuer.key);
-    if !okk { return none, ERR_MALFORMED; }
+    if !okk { return [], ERR_MALFORMED; }
     id.key_hash.append(bignum::hash_bits(t.hash, kb));
     id.serial.append(t.serial);
     var single: u8[>..] = [];
@@ -440,7 +473,7 @@ fn ocsp_create_response(issuer: const Cert&, responder: const Cert&, key: const 
     basic.append(tbs);
     basic.append(sig_alg_id(alg, h));
     let sig, oks = sign(key, alg, h, tbs);
-    if !oks { return none, ERR_SIGNING; }
+    if !oks { return [], ERR_SIGNING; }
     asn1::put_bits(basic, sig);
     if include_cert {
         var certs: u8[>..] = [];
