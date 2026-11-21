@@ -426,6 +426,12 @@ fn ocsp_put_gtime(out: u8[>..]&, unix: i64) {
 // reason of 0 (unspecified) left out.
 fn ocsp_create_response(issuer: const Cert&, responder: const Cert&, key: const PrivateKey&, t: const OcspTemplate&,
                         produced_at: i64, include_cert: bool) -> u8[>..], i64 {
+    let r0, r1 = ocsp_create_response(issuer, responder, key, t, produced_at, include_cert, sign_data);
+    return r0, r1;
+}
+
+fn ocsp_create_response<F>(issuer: const Cert&, responder: const Cert&, key: const PrivateKey&, t: const OcspTemplate&,
+                        produced_at: i64, include_cert: bool) -> u8[>..], i64 {
     var alg = t.sig_alg;
     var h = t.sig_hash;
     if alg == 0 {
@@ -472,7 +478,7 @@ fn ocsp_create_response(issuer: const Cert&, responder: const Cert&, key: const 
     var basic: u8[>..] = [];
     basic.append(tbs);
     basic.append(sig_alg_id(alg, h));
-    let sig, oks = sign(key, alg, h, tbs);
+    let sig, oks = sign_with(key, alg, h, tbs, F);
     if !oks { return [], ERR_SIGNING; }
     asn1::put_bits(basic, sig);
     if include_cert {

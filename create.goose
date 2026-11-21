@@ -13,7 +13,7 @@ import asn1;
 import keys;
 import bignum;
 import bignum.sha1;
-import bignum.entropy;
+import entropy;
 
 // --- Names --------------------------------------------------------------------
 
@@ -335,8 +335,13 @@ fn put_extensions(out: u8[>..]&, t: const Template&, spki: const u8[:], issuer_k
 // Signs a to-be-signed SEQUENCE: tbs, AlgorithmIdentifier, BIT STRING;
 // empty and false when signing fails.
 fn signed(tbs: const u8[:], alg_id: const u8[:], key: const PrivateKey&, alg: i64, h: i64) -> u8[>..], bool {
+    let r0, r1 = signed(tbs, alg_id, key, alg, h, sign_data);
+    return r0, r1;
+}
+
+fn signed<F>(tbs: const u8[:], alg_id: const u8[:], key: const PrivateKey&, alg: i64, h: i64) -> u8[>..], bool {
     var out: u8[>..] = [];
-    let sig, ok = sign(key, alg, h, tbs);
+    let sig, ok = sign_with(key, alg, h, tbs, F);
     if !ok { return out, false; }
     var body: u8[>..] = [];
     body.append(tbs);
@@ -358,6 +363,12 @@ fn pick_alg(t_alg: i64, t_hash: i64, key: const PrivateKey&) -> i64, i64 {
 // for a template or key that will not encode, ERR_UNSUPPORTED_ALGORITHM
 // when the key cannot sign with the algorithm asked for.
 fn create_certificate(t: const Template&, spki: const u8[:], issuer_der: const u8[:],
+                      issuer_key: const PrivateKey&) -> u8[>..], i64 {
+    let r0, r1 = create_certificate(t, spki, issuer_der, issuer_key, sign_data);
+    return r0, r1;
+}
+
+fn create_certificate<F>(t: const Template&, spki: const u8[:], issuer_der: const u8[:],
                       issuer_key: const PrivateKey&) -> u8[>..], i64 {
     var none: u8[>..] = [];
     let alg, h = pick_alg(t.sig_alg, t.sig_hash, issuer_key);
@@ -383,7 +394,7 @@ fn create_certificate(t: const Template&, spki: const u8[:], issuer_der: const u
     serial.append(t.serial);
     if serial.len == 0 {
         serial.resize(16, 0);
-        bignum::random_bytes(serial);
+        entropy::random_bytes(serial);
         serial[0] = (serial[0] & 0x7f) | 0x01;               // positive, and 16 bytes long
     }
     let alg_id = sig_alg_id(alg, h);
@@ -403,12 +414,19 @@ fn create_certificate(t: const Template&, spki: const u8[:], issuer_der: const u
     if !put_extensions(tbs, t, spki, issuer_kid) { return none, ERR_MALFORMED; }
     var tbs_seq: u8[>..] = [];
     asn1::put(tbs_seq, asn1::SEQUENCE, tbs);
-    var cert, oks = signed(tbs_seq, alg_id, issuer_key, alg, h);
+    var cert, oks = signed(tbs_seq, alg_id, issuer_key, alg, h, F);
     if !oks { return none, ERR_SIGNING; }
-    // What was made must parse.
+    // What was made must parse; and, signed by a signer (a key held
+    // elsewhere), its signature must verify, as Go checks a crypto.Signer's.
     let c, pe = parse(cert);
-    if pe != OK { cert.clear(); }
-    return cert, pe;
+    var e2 = pe;
+    if e2 == OK && is_external(issuer_key) {
+        if issuer_der.len == 0 { e2 = check_signature(c, c); }
+        else { let ic, ei = parse(issuer_der); e2 = check_signature(c, ic); }
+        if e2 != OK { e2 = ERR_BAD_SIGNATURE; }
+    }
+    if e2 != OK { cert.clear(); }
+    return cert, e2;
 }
 
 // --- Certificate requests (PKCS #10, RFC 2986) ------------------------------------
@@ -423,7 +441,12 @@ struct Csr {
 // A request for subject (Name DER) and the SAN entries in `san` (a
 // GeneralNames builder's contents; empty for none), signed by key.
 fn create_csr(subject: const u8[:], san: const u8[:], key: const PrivateKey&) -> u8[>..], i64 {
-    let csr, e = create_csr_attrs(subject, san, key, "");
+    let r0, r1 = create_csr(subject, san, key, sign_data);
+    return r0, r1;
+}
+
+fn create_csr<F>(subject: const u8[:], san: const u8[:], key: const PrivateKey&) -> u8[>..], i64 {
+    let csr, e = create_csr_attrs(subject, san, key, "", F);
     return csr, e;
 }
 
@@ -432,6 +455,11 @@ fn create_csr(subject: const u8[:], san: const u8[:], key: const PrivateKey&) ->
 // extensionRequest: challengePassword for SCEP (RFC 8894 §3.3.1), what an
 // EST server's /csrattrs asks for (RFC 7030 §4.5).
 fn create_csr_attrs(subject: const u8[:], san: const u8[:], key: const PrivateKey&, more: const u8[:]) -> u8[>..], i64 {
+    let r0, r1 = create_csr_attrs(subject, san, key, more, sign_data);
+    return r0, r1;
+}
+
+fn create_csr_attrs<F>(subject: const u8[:], san: const u8[:], key: const PrivateKey&, more: const u8[:]) -> u8[>..], i64 {
     let alg, h = default_sig(key.kind);
     if !sig_fits_key(key.kind, alg, h) { return [], ERR_UNSUPPORTED_ALGORITHM; }    // ML-KEM, X448: no signatures
     var info: u8[>..] = [];
@@ -456,8 +484,13 @@ fn create_csr_attrs(subject: const u8[:], san: const u8[:], key: const PrivateKe
     asn1::put(info, asn1::ctx(0, true), attrs);
     var info_seq: u8[>..] = [];
     asn1::put(info_seq, asn1::SEQUENCE, info);
-    let csr, ok = signed(info_seq, sig_alg_id(alg, h), key, alg, h);
-    return csr, if ok { OK } else { ERR_SIGNING };
+    var csr, ok = signed(info_seq, sig_alg_id(alg, h), key, alg, h, F);
+    if !ok { return csr, ERR_SIGNING; }
+    if is_external(key) {                       // a signer's signature must verify
+        let r, e = parse_csr(csr);
+        if e != OK || check_csr(r) != OK { csr.clear(); return csr, ERR_BAD_SIGNATURE; }
+    }
+    return csr, OK;
 }
 
 fn parse_csr(der: const u8[:]) -> Csr, i64 {
@@ -564,6 +597,12 @@ struct Revoked { serial: u8[..20], time: i64, reason: i64 }
 // identifier and a CRL number.
 fn create_crl(issuer_der: const u8[:], key: const PrivateKey&, entries: const Revoked[:], this_update: i64,
               next_update: i64, number: i64) -> u8[>..], i64 {
+    let r0, r1 = create_crl(issuer_der, key, entries, this_update, next_update, number, sign_data);
+    return r0, r1;
+}
+
+fn create_crl<F>(issuer_der: const u8[:], key: const PrivateKey&, entries: const Revoked[:], this_update: i64,
+              next_update: i64, number: i64) -> u8[>..], i64 {
     var none: u8[>..] = [];
     let ic, e = parse(issuer_der);
     if e != OK { return none, e; }
@@ -611,6 +650,6 @@ fn create_crl(issuer_der: const u8[:], key: const PrivateKey&, entries: const Re
     asn1::put(tbs, asn1::ctx(0, true), extseq);
     var tbs_seq: u8[>..] = [];
     asn1::put(tbs_seq, asn1::SEQUENCE, tbs);
-    let crl, ok = signed(tbs_seq, alg_id, key, alg, h);
+    let crl, ok = signed(tbs_seq, alg_id, key, alg, h, F);
     return crl, if ok { OK } else { ERR_SIGNING };
 }

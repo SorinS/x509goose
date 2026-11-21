@@ -36,7 +36,7 @@ import bignum.sha3;
 import bignum.ct;
 import bignum.dsa;
 import bignum.hmac;
-import bignum.entropy;
+import entropy;
 
 // A private key of one of the KEY_* types: an EC scalar (big-endian, the
 // curve's length), an Ed25519 or ML-DSA seed, a DSA key, or an RSA key.
@@ -45,8 +45,14 @@ import bignum.entropy;
 // An SLH-DSA key is its 4n bytes SK.seed || SK.prf || PK.seed || PK.root
 // in slh. An Ed448 key is its 57-byte seed, an X448 key its 56 bytes, in
 // key448.
+//
+// A key held elsewhere (a TPM's, a PKCS#11 token's, a remote service's) is
+// its SubjectPublicKeyInfo in spki and nothing else: external_key makes
+// one. It stands for that key wherever a configuration takes a key, and the
+// signing is done by a signer passed to the call that signs (see
+// sign_data); sign and sign_digest refuse it.
 struct PrivateKey { kind: i64, ec_sk: u8[..66], seed: u8[32], dsa: bignum::DsaKey, rsa: bignum::RsaPrivateKey,
-                    kem_seed: u8[..64], kem_dk: u8[..3168], slh: u8[..128], key448: u8[..57] }
+                    kem_seed: u8[..64], kem_dk: u8[..3168], slh: u8[..128], key448: u8[..57], spki: u8[..3000] = [] }
 
 fn empty_key() -> PrivateKey {
     PrivateKey { kind: KEY_UNKNOWN, ec_sk: [], seed: [0; 32], dsa: bignum::DsaKey { p: [], q: [], g: [], y: [], x: [] },
@@ -58,6 +64,7 @@ fn curve_oid(kind: i64) -> const u8[:] {
     if kind == KEY_EC_P256 { "1.2.840.10045.3.1.7" } else if kind == KEY_EC_P384 { "1.3.132.0.34" }
     else if kind == KEY_EC_P224 { "1.3.132.0.33" } else if kind == KEY_EC_BP256 { "1.3.36.3.3.2.8.1.1.7" }
     else if kind == KEY_EC_BP384 { "1.3.36.3.3.2.8.1.1.11" } else if kind == KEY_EC_BP512 { "1.3.36.3.3.2.8.1.1.13" }
+    else if kind == KEY_EC_SECP256K1 { "1.3.132.0.10" }
     else { "1.3.132.0.35" }
 }
 
@@ -345,7 +352,12 @@ fn seq(out: u8[>..]&, content: const u8[:]) { asn1::put(out, asn1::SEQUENCE, con
 // INTEGER y.
 fn public_key_bytes(k: const PrivateKey&) -> u8[>..] {
     var out: u8[>..] = [];
-    if k.kind == KEY_RSA {
+    if is_external(k) {
+        let t, ok = asn1::parse(k.spki);
+        let p, okc = asn1::children(k.spki, t);
+        let bits, unused, okb = asn1::read_bits(k.spki, p[1]);
+        out.append(bits);
+    } else if k.kind == KEY_RSA {
         var body: u8[>..] = [];
         put_limbs_uint(body, k.rsa.n);
         put_limbs_uint(body, k.rsa.e);
@@ -380,6 +392,13 @@ fn mldsa_oid(set: i64) -> const u8[:] {
 fn key_alg_id(k: const PrivateKey&) -> u8[>..] {
     let kind = k.kind;
     var body: u8[>..] = [];
+    if is_external(k) {
+        let t, ok = asn1::parse(k.spki);
+        let p, okc = asn1::children(k.spki, t);
+        var out: u8[>..] = [];
+        out.append(k.spki[p[0].start..p[0].end]);
+        return out;
+    }
     if kind == KEY_RSA {
         asn1::put_oid(body, "1.2.840.113549.1.1.1");
         asn1::put_null(body);
@@ -413,6 +432,7 @@ fn key_alg_id(k: const PrivateKey&) -> u8[>..] {
 
 // SubjectPublicKeyInfo (MarshalPKIXPublicKey).
 fn marshal_public_key(k: const PrivateKey&) -> u8[>..] {
+    if is_external(k) { var out: u8[>..] = []; out.append(k.spki); return out; }
     var body = key_alg_id(k);
     asn1::put_bits(body, public_key_bytes(k));
     var out: u8[>..] = [];
@@ -572,6 +592,7 @@ fn sig_fits_key(kind: i64, alg: i64, h: i64) -> bool {
 fn sign(k: const PrivateKey&, alg: i64, h: i64, msg: const u8[:]) -> u8[>..], bool {
     assert(sig_fits_key(k.kind, alg, h));
     var out: u8[>..] = [];
+    if is_external(k) { return out, false; }
     if alg == SIG_ED25519 { out.append(bignum::ed25519_sign(k.seed, msg)); return out, true; }
     if alg == SIG_ED448 { out.append(bignum::ed448_sign(k.key448, msg)); return out, true; }
     if alg == SIG_MLDSA { out.append(bignum::mldsa_sign(h, k.seed, msg)); return out, true; }
@@ -586,6 +607,7 @@ fn sign(k: const PrivateKey&, alg: i64, h: i64, msg: const u8[:]) -> u8[>..], bo
 fn sign_digest(k: const PrivateKey&, alg: i64, h: i64, digest: const u8[:]) -> u8[>..], bool {
     assert(sig_fits_key(k.kind, alg, h));
     var out: u8[>..] = [];
+    if is_external(k) { return out, false; }
     if alg == SIG_ED25519 || alg == SIG_ED448 || alg == SIG_MLDSA || alg == SIG_SLHDSA || digest.len != bignum::hash_len(h) { return out, false; }
     if alg == SIG_RSA_PKCS1 {
         let s, ok = bignum::rsa_sign_pkcs1_digest(k.rsa, digest, h);
@@ -602,4 +624,84 @@ fn sign_digest(k: const PrivateKey&, alg: i64, h: i64, digest: const u8[:]) -> u
         out.append(bignum::ecdsa_sig_to_der(bignum::ecdsa_sign_digest(c, k.ec_sk, digest, h)));
     }
     return out, true;
+}
+
+// --- Keys held elsewhere, and signers --------------------------------------
+//
+// A signer is a function, or a block, that the calls which sign (TLS's
+// feed, create_csr, cms_sign, jws's sign, ssh's) take as their last
+// argument, as Go's crypto.Signer:
+//
+//   F(key: const PrivateKey&, alg: i64, h: i64, data: const u8[:]) -> u8[>..]
+//
+// key is the key the configuration names (for one held elsewhere, its
+// external_key), alg one of SIG_* and h the hash (hash_bits' numbers; ML-DSA's
+// and SLH-DSA's parameter set). data is the digest by h of what is signed,
+// as Go's Sign takes it, except for the algorithms that sign the message
+// itself (signs_message: Ed25519, Ed448, ML-DSA, SLH-DSA), which get the
+// message. It returns the signature as sign would (RSA as is, ECDSA and DSA
+// as a DER SEQUENCE of r and s; RSA-PSS with a salt as long as the hash),
+// or nothing when it cannot sign. Calls given no signer use sign_data,
+// which signs with a key in memory. A block may name the caller's locals,
+// such as an open TPM or PKCS#11 session:
+//
+//   tls::feed(c, cfg, input, out, app) { k, alg, h, data => tpm2::sign_data(t, key, alg, h, data) }
+
+// Whether alg signs the message itself rather than a digest of it.
+fn signs_message(alg: i64) -> bool {
+    alg == SIG_ED25519 || alg == SIG_ED448 || alg == SIG_MLDSA || alg == SIG_SLHDSA
+}
+
+// What a signer is given to sign msg with alg and h: the message, or its
+// digest.
+fn data_to_sign(alg: i64, h: i64, msg: const u8[:]) -> u8[>..] {
+    if signs_message(alg) { var out: u8[>..] = []; out.append(msg); return out; }
+    return bignum::hash_bits(h, msg);
+}
+
+// The signer for keys in memory: sign for the algorithms that sign
+// messages, sign_digest for the rest. Empty when it cannot sign (a key held
+// elsewhere among them).
+fn sign_data(k: const PrivateKey&, alg: i64, h: i64, data: const u8[:]) -> u8[>..] {
+    if !sig_fits_key(k.kind, alg, h) { return []; }
+    if signs_message(alg) {
+        var s, ok = sign(k, alg, h, data);
+        if !ok { s.clear(); }
+        return s;
+    }
+    var s, ok = sign_digest(k, alg, h, data);
+    if !ok { s.clear(); }
+    return s;
+}
+
+// Signs msg with signer F, as sign does with a key in memory: what the
+// calls that take a signer use. Empty and false when F cannot.
+fn sign_with<F>(k: const PrivateKey&, alg: i64, h: i64, msg: const u8[:]) -> u8[>..], bool {
+    if !sig_fits_key(k.kind, alg, h) { return [], false; }
+    let s = F(k, alg, h, data_to_sign(alg, h, msg));
+    return s, s.len > 0;
+}
+
+// Whether k is a key held elsewhere: a public key alone.
+fn is_external(k: const PrivateKey&) -> bool { k.spki.len > 0 }
+
+// A key held elsewhere, from its SubjectPublicKeyInfo (DER): what a
+// configuration takes in place of the private key, its kind and public key
+// known. False for one that does not parse, of a kind x509 does not know,
+// or longer than 3000 bytes.
+fn external_key(spki: const u8[:]) -> PrivateKey, bool {
+    var k = empty_key();
+    let t, ok = asn1::parse(spki);
+    if !ok || spki.len > 3000 { return k, false; }
+    let kind, key, okk = spki_of(spki, t);
+    if !okk || kind == KEY_UNKNOWN { return k, false; }
+    k.kind = kind;
+    k.spki.append(spki);
+    return k, true;
+}
+
+// The key held elsewhere whose certificate is c: its public key.
+fn external_key(c: const Cert&) -> PrivateKey, bool {
+    let k, ok = external_key(c.der[c.spki.start..c.spki.end]);
+    return k, ok;
 }

@@ -16,7 +16,7 @@ CertificateVerify signatures.
 | `x509.crl` | `Crl`, `parse_crl`, `check_crl`, `crl_lookup`, `revocation_status` |
 | `x509.keys` | `PrivateKey`, key generation, PKCS #8 / SEC 1 / PKCS #1 / SPKI parsing and marshalling (brainpool, Ed448, X448, ML-DSA, SLH-DSA, ML-KEM and DSA included), signing |
 | `x509.ocsp` | OCSP (RFC 6960): `ocsp_create_request`, `ocsp_parse_request`, `ocsp_parse_response`, `ocsp_check_response`, `ocsp_create_response`, `ocsp_error_response` |
-| `x509.pkcs12` | `pkcs12_decode`: PKCS #12 files to their key and certificates |
+| `x509.pkcs12` | `pkcs12_decode`: PKCS #12 files to their key and certificates; `pkcs12_encode`: a key and certificates to one |
 | `x509.cms` | CMS SignedData (RFC 5652) with one signer: `cms_sign`, `cms_sign_with` (id-data, detached, signingTime, smimeCapabilities, key identifier, Ed25519, Ed448), `cms_unsigned`, `cms_parse_signed`, `cms_parse_signed_ber`, `cms_verify`, `cms_verify_detached`, `cms_signing_time`, `cms_content`, `cms_certs`, `cms_der` (BER to DER); ML-DSA signers (RFC 9882) and SHAKE digests; PKINIT's carrier and S/MIME's |
 | `x509.cms_env` | CMS EnvelopedData and AuthEnvelopedData (RFC 5652 §6, RFC 5083/5084): `cms_encrypt`, `cms_decrypt`, `cms_content_type`; RSA-OAEP and PKCS #1 v1.5 key transport, ECDH key agreement (RFC 5753; NIST and brainpool curves), X448 key agreement (RFC 8418), ML-KEM recipients (KEMRecipientInfo, RFC 9629 and RFC 9936), AES-CBC and AES-GCM |
 | `x509.create` | `Template`, `create_certificate`, `name_der`, SAN and name-constraint builders, `create_csr`, `parse_csr`, `check_csr`, `create_crl` | It builds on
@@ -24,9 +24,10 @@ CertificateVerify signatures.
 cryptography.
 
 ```goose
-import x509 from "SorinS/x509goose@v0.7.0";
-import bignum from "SorinS/bigmongoose@v0.7.0";   // x509 needs it; the root declares it
-import asn1 from "SorinS/asn1goose@v0.7.0";
+import x509 from "SorinS/x509goose@v0.9.1";
+import entropy from "SorinS/entropygoose@v0.9.1";   // x509 needs it; the root declares it
+import bignum from "SorinS/bigmongoose@v0.9.1";
+import asn1 from "SorinS/asn1goose@v0.9.1";
 import x509.verify;
 
 let err = x509::verify_chain(leaf_der, intermediates_der, roots_der, now, "example.com");
@@ -87,7 +88,9 @@ checks no DSA signatures; here they are checked, as openssl does.
 The brainpool curves are named curves under id-ecPublicKey
 (1.3.36.3.3.2.8.1.1.7, .11 and .13: `KEY_EC_BP256`, `KEY_EC_BP384`,
 `KEY_EC_BP512`; `is_brainpool`, and `is_ec` takes them with the NIST
-ones), signing ECDSA with any of SHA-256, -384 and -512. Ed448
+ones), signing ECDSA with any of SHA-256, -384 and -512; secp256k1
+(1.3.132.0.10, `KEY_EC_SECP256K1`) is one too, for KMIP and the like
+(Go's crypto/x509 does not take it). Ed448
 (`KEY_ED448`, `SIG_ED448`, id-Ed448 1.3.101.113) and X448 (`KEY_X448`,
 id-X448 1.3.101.111) are RFC 8410's: parameters absent. The TLS 1.3
 ECDSA schemes name a NIST curve, so `verify_scheme` refuses brainpool
@@ -292,6 +295,36 @@ it is the curve's own hash (SHA-256, -384 and -512 for the three
 brainpool curves), and for ML-DSA (and SLH-DSA) the key's own set. For DSA it
 is SHA-256, as in openssl.
 
+## Keys held elsewhere
+
+A key in a TPM, on a PKCS#11 token or in a remote service is a
+`PrivateKey` holding only its SubjectPublicKeyInfo: `external_key(spki)`,
+or `external_key(cert)` for the key a certificate names; `is_external(k)`
+says which. It stands for the key in configurations (its kind and
+`marshal_public_key` are the real key's), and `sign` and `sign_digest`
+refuse it. The calls that sign take a signer as their last argument,
+which does the signing, as Go's crypto.Signer:
+
+    F(key: const PrivateKey&, alg: i64, h: i64, data: const u8[:]) -> u8[>..]
+
+alg is one of `SIG_*` and h the hash (`SIG_MLDSA` and `SIG_SLHDSA`: the
+parameter set); data is the digest by h of what is signed, except for
+the algorithms that sign the message itself (`signs_message`: Ed25519,
+Ed448, ML-DSA, SLH-DSA), which get the message (`data_to_sign` makes
+either). The signer returns the signature as `sign` would (RSA as is,
+ECDSA and DSA as DER; RSA-PSS with a salt as long as the hash), or nothing
+when it cannot sign. `sign_data` is the signer for keys in memory, which
+the calls given none use, and `sign_with(k, alg, h, msg, F)` signs a
+message through F. `create_certificate`, `create_csr`,
+`create_csr_attrs`, `create_crl`, `ocsp_create_response`, `cms_sign` and
+`cms_sign_with` take a signer; a certificate or CSR made through one has
+its signature checked against the public key before it is returned
+(`ERR_BAD_SIGNATURE` otherwise), as Go checks a crypto.Signer's. tpm2 and
+pkcs11 give signers for their keys (`tpm2::sign_data`, `p11::sign_data`).
+test/signer.goose makes a root, a CSR, a certificate, a CRL, an OCSP
+response and CMS through a signer for P-256, P-384, RSA, Ed25519 and
+ML-DSA-44 issuers, each checked.
+
 ## Creating certificates, requests and CRLs
 
 ```goose
@@ -364,6 +397,16 @@ refuses: openssl 3's default PBES2 (PBKDF2 and AES-CBC), 2-key 3DES,
 file without a MAC is read only with the empty password; under any other
 it is ERR_BAD_SIGNATURE, as in Go, since nothing would hold its contents
 to the password.
+
+`pkcs12_encode(key, certs, password, iterations = 2048) -> pfx, err`
+writes one as openssl 3 does by default: the key (PKCS #8 DER, or empty)
+in a shrouded key bag and the certificates (DER concatenated, the key's
+first) in an encrypted SafeContents, both under PBES2 with PBKDF2 over
+HMAC-SHA-256 and AES-256-CBC, the whole under an HMAC-SHA-256 MAC keyed
+by the PKCS #12 KDF; the key and its certificate share a localKeyID.
+openssl 4.1 reads what it writes (the MAC, the key, the certificate; a
+wrong password refused). A password with a character past U+FFFF, which
+the KDF cannot take, is ERR_MALFORMED.
 
 ## CMS SignedData
 
@@ -482,7 +525,7 @@ In `examples/`, run from the repository's top as `goose examples/<name>.goose`
 - `csr.goose`: a CSR made, checked against a name policy and issued; a changed one refused.
 - `crl.goose`: a CRL issued, read and looked up, and path validation with revocation checking.
 - `ocsp.goose`: an OCSP request and response, client and responder in one process, with a delegated responder.
-- `pkcs12.goose`: a .p12 read (`example.p12`, password `goose`), its key matched to its certificate and written as PKCS #8.
+- `pkcs12.goose`: a .p12 read (`example.p12`, password `goose`), its key matched to its certificate, written again under a new password and read back, and the key written as PKCS #8.
 - `cms_signed.goose`: CMS SignedData with ECDSA and RSA-PSS: signing, verifying signer and path, refusing changed content.
 - `cms_pq.goose`: post-quantum CMS with keys made on the spot: SignedData by ML-DSA-65 with its path to an ML-DSA CA, and AuthEnvelopedData to an ML-KEM-768 certificate; a changed signature and a wrong key refused.
 - `system_roots.goose`: the OS's root store loaded and used, with a private root added to a copy.
@@ -628,7 +671,8 @@ its arguments.
   passwords, each decoding to openssl's key and certificates; wrong
   passwords and changed bytes refused, the files without a MAC refused
   under a password. Go's x/crypto/pkcs12 reads the 12
-  legacy ones to the same keys (and refuses the rest).
+  legacy ones to the same keys (and refuses the rest). Each key and its
+  certificates are written again with `pkcs12_encode` and read back.
 - `cms_vectors`: SignedData from `openssl cms -sign` (24, from
   `scripts/cms_vectors.py`): RSA (PKCS #1 v1.5 and PSS), P-256, P-384 and
   P-521 over SHA-256, -384 and -512, signers by issuer and serial and by

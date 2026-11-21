@@ -245,9 +245,15 @@ fn cms_signed_attrs_with(content_type: const u8[:], digest: const u8[:], o: cons
 // up from the signer's), DER laid end to end. False if signing fails.
 fn cms_sign(content_type: const u8[:], content: const u8[:], key: const PrivateKey&, signer: const Cert&,
             others: const u8[:], alg: i64, h: i64) -> u8[>..], bool {
+    let r0, r1 = cms_sign(content_type, content, key, signer, others, alg, h, sign_data);
+    return r0, r1;
+}
+
+fn cms_sign<F>(content_type: const u8[:], content: const u8[:], key: const PrivateKey&, signer: const Cert&,
+            others: const u8[:], alg: i64, h: i64) -> u8[>..], bool {
     assert(alg == SIG_RSA_PKCS1 || alg == SIG_RSA_PSS || alg == SIG_ECDSA);
     let o = CmsSignOptions { .. };
-    let out, ok = cms_sign_with(content_type, content, key, signer, others, alg, h, o);
+    let out, ok = cms_sign_with(content_type, content, key, signer, others, alg, h, o, F);
     return out, ok;
 }
 
@@ -264,6 +270,12 @@ fn cms_sign(content_type: const u8[:], content: const u8[:], key: const PrivateK
 // for alg, or the signer's certificate has no key identifier to name it by.
 fn cms_sign_with(content_type: const u8[:], content: const u8[:], key: const PrivateKey&, signer: const Cert&,
                  others: const u8[:], alg: i64, h: i64, o: const CmsSignOptions&) -> u8[>..], bool {
+    let r0, r1 = cms_sign_with(content_type, content, key, signer, others, alg, h, o, sign_data);
+    return r0, r1;
+}
+
+fn cms_sign_with<F>(content_type: const u8[:], content: const u8[:], key: const PrivateKey&, signer: const Cert&,
+                 others: const u8[:], alg: i64, h: i64, o: const CmsSignOptions&) -> u8[>..], bool {
     assert(alg == SIG_RSA_PKCS1 || alg == SIG_RSA_PSS || alg == SIG_ECDSA || alg == SIG_ED25519 || alg == SIG_ED448 ||
            alg == SIG_MLDSA);
     var none: u8[>..] = [];
@@ -271,6 +283,7 @@ fn cms_sign_with(content_type: const u8[:], content: const u8[:], key: const Pri
     let ml = alg == SIG_MLDSA;
     if ml && (!is_mldsa(key.kind) || (h != 0 && h != 256 && h != 384 && h != 512 && h != CMS_SHAKE256)) { return none, false; }
     let sha1 = alg == SIG_RSA_PKCS1 && h == 160 && key.kind == KEY_RSA;
+    if sha1 && is_external(key) { return none, false; }        // SHA-1 only with a key in memory
     if !sha1 && !sig_fits_key(key.kind, alg, if ed { 0 } else if ml { mldsa_set(key.kind) } else { h }) { return none, false; }
     let dh = if alg == SIG_ED448 { CMS_SHAKE256_LEN } else if ed || (ml && h == 0) { 512 } else { h };   // the digest's hash
     let sh = if ed { 0 } else if ml { mldsa_set(key.kind) } else { h };   // the signature's (ML-DSA: the set)
@@ -283,7 +296,7 @@ fn cms_sign_with(content_type: const u8[:], content: const u8[:], key: const Pri
         if !ok1 { return none, false; }
         sig = copy(s1);
     } else {
-        let s2, ok2 = sign(key, alg, sh, attrs);
+        let s2, ok2 = sign_with(key, alg, sh, attrs, F);
         if !ok2 { return none, false; }
         sig = copy(s2);
     }

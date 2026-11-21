@@ -5,11 +5,13 @@
 // encryption, no MAC and a SHA-512 MAC; empty, ASCII and non-ASCII
 // passwords. Each decodes to openssl's key and certificates; a wrong
 // password and a changed byte are refused, and so is a file without a MAC
-// under any password but the empty one.
+// under any password but the empty one. Each key and its certificates
+// are encoded again with pkcs12_encode and read back.
 import std;
 import x509 from "..";
-import bignum from "SorinS/bigmongoose@v0.7.0";
-import asn1 from "SorinS/asn1goose@v0.7.0";
+import entropy from "SorinS/entropygoose@v0.9.1";
+import bignum from "SorinS/bigmongoose@v0.9.1";
+import asn1 from "SorinS/asn1goose@v0.9.1";
 import x509.keys;
 import x509.pkcs12;
 
@@ -76,7 +78,21 @@ fn main() {
         bad[bad.len / 2] ^= 1;
         let k3, c3, e3 = x509::pkcs12_decode(bad, pw);
         check("changed", e3 != x509::OK || nomac);
+        // Encoded again here (PBES2, AES-256, a SHA-256 MAC; 16 rounds to
+        // keep the test short) and decoded to the same key and certificates.
+        if okk {
+            let again, ee = x509::pkcs12_encode(key, want, pw, 16);
+            let k4, c4, e4 = x509::pkcs12_decode(again, pw);
+            let kk4, okk4 = x509::parse_private_key(k4);
+            check("encoded and read back", ee == x509::OK && e4 == x509::OK && okk4 &&
+                  x509::marshal_pkcs8(kk4) == x509::marshal_pkcs8(k) && c4 == want);
+            let k5, c5, e5 = x509::pkcs12_decode(again, wrong);
+            check("encoded: a wrong password refused", e5 == x509::ERR_BAD_SIGNATURE);
+        }
     }
+    let lone, el = x509::pkcs12_encode("", "", "pw", 16);
+    let k6, c6, e6 = x509::pkcs12_decode(lone, "pw");
+    check("encoded empty", el == x509::OK && e6 == x509::OK && k6.len == 0 && c6.len == 0);
     let bmp, ok = x509::bmp_password("a\xc3\xa9");
     check("bmp password", ok && bmp == "\x00a\x00\xe9\x00\x00");
     let bmp2, ok2 = x509::bmp_password("\xf0\x9f\x98\x80");

@@ -7,8 +7,9 @@
 // RFC 8448 server's CertificateVerify must verify under its certificate.
 import std;
 import x509 from "..";
-import bignum from "SorinS/bigmongoose@v0.7.0";
-import asn1 from "SorinS/asn1goose@v0.7.0";
+import entropy from "SorinS/entropygoose@v0.9.1";
+import bignum from "SorinS/bigmongoose@v0.9.1";
+import asn1 from "SorinS/asn1goose@v0.9.1";
 import x509.verify;
 import x509.crl;
 

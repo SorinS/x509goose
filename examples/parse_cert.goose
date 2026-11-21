@@ -8,8 +8,9 @@
 import std;
 import os;
 import x509 from "..";
-import bignum from "SorinS/bigmongoose@v0.7.0";
-import asn1 from "SorinS/asn1goose@v0.7.0";
+import entropy from "SorinS/entropygoose@v0.9.1";
+import bignum from "SorinS/bigmongoose@v0.9.1";
+import asn1 from "SorinS/asn1goose@v0.9.1";
 
 fn date(t: i64) -> u8[>..] {
     let y, m, d = asn1::civil_from_days(t / 86400);

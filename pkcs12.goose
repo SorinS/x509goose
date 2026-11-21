@@ -1,5 +1,6 @@
 // x509.pkcs12: decoding PKCS #12 files (.p12, .pfx; RFC 7292) into their
-// private keys and certificates, as Go's x/crypto/pkcs12 does, and more:
+// private keys and certificates, as Go's x/crypto/pkcs12 does, and more;
+// and encoding them as openssl 3 does (pkcs12_encode, below):
 //
 // - the integrity MAC: HMAC over SHA-1 (Go's only one), SHA-224, -256,
 //   -384 or -512, keyed by the PKCS #12 KDF from the password;
@@ -27,6 +28,7 @@ import bignum.aes;
 import bignum.des;
 import bignum.rc2;
 import bignum.modes;
+import entropy;
 
 let OID_PKCS7_DATA: const u8[:] = "1.2.840.113549.1.7.1";
 let OID_PKCS7_ENCRYPTED: const u8[:] = "1.2.840.113549.1.7.6";
@@ -312,4 +314,166 @@ fn pkcs12_decode(pfx: const u8[:], password: const u8[:]) -> u8[>..], u8[>..], i
     }
     if nkeys > 1 { return key, certs, ERR_MALFORMED; }
     return key, certs, OK;
+}
+
+// --- Encoding ---------------------------------------------------------------------
+
+// An AlgorithmIdentifier of PBES2: PBKDF2 over HMAC-SHA-256 and
+// AES-256-CBC, with this salt, iteration count and IV.
+fn put_pbes2(out: u8[>..]&, salt: const u8[:], iterations: i64, iv: const u8[:]) {
+    var prf: u8[>..] = [];
+    asn1::put_oid(prf, "1.2.840.113549.2.9");
+    asn1::put_null(prf);
+    var kp: u8[>..] = [];
+    asn1::put_octets(kp, salt);
+    asn1::put_i64(kp, iterations);
+    asn1::put(kp, asn1::SEQUENCE, prf);
+    var kdf: u8[>..] = [];
+    asn1::put_oid(kdf, "1.2.840.113549.1.5.12");
+    asn1::put(kdf, asn1::SEQUENCE, kp);
+    var es: u8[>..] = [];
+    asn1::put_oid(es, "2.16.840.1.101.3.4.1.42");
+    asn1::put_octets(es, iv);
+    var p2: u8[>..] = [];
+    asn1::put(p2, asn1::SEQUENCE, kdf);
+    asn1::put(p2, asn1::SEQUENCE, es);
+    var alg: u8[>..] = [];
+    asn1::put_oid(alg, "1.2.840.113549.1.5.13");
+    asn1::put(alg, asn1::SEQUENCE, p2);
+    asn1::put(out, asn1::SEQUENCE, alg);
+}
+
+// data encrypted under PBES2 from the password: its AlgorithmIdentifier
+// into alg, the ciphertext returned.
+fn pbes2_encrypt(data: const u8[:], password: const u8[:], iterations: i64, alg: u8[>..]&) -> u8[>..] {
+    var salt: u8[16] = [0; 16];
+    entropy::random_bytes(salt);
+    var iv: u8[16] = [0; 16];
+    entropy::random_bytes(iv);
+    let key = bignum::pbkdf2(256, password, salt, iterations, 32);
+    let c = bignum::aes_init(key);
+    var buf = bignum::pkcs7_pad(data, 16);
+    bignum::cbc_encrypt(c, iv, buf);
+    put_pbes2(alg, salt, iterations, iv);
+    return buf;
+}
+
+// A SafeBag: bagId, [0] EXPLICIT the value, and the localKeyID attribute
+// (pairing the key with its certificate) when id is not empty.
+fn put_bag(out: u8[>..]&, oid: const u8[:], value: const u8[:], id: const u8[:]) {
+    var b: u8[>..] = [];
+    asn1::put_oid(b, oid);
+    asn1::put(b, asn1::ctx(0, true), value);
+    if id.len > 0 {
+        var octets: u8[>..] = [];
+        asn1::put_octets(octets, id);
+        var attr: u8[>..] = [];
+        asn1::put_oid(attr, "1.2.840.113549.1.9.21");
+        asn1::put(attr, asn1::SET, octets);
+        var one: u8[>..] = [];
+        asn1::put(one, asn1::SEQUENCE, attr);
+        asn1::put(b, asn1::SET, one);
+    }
+    asn1::put(out, asn1::SEQUENCE, b);
+}
+
+// Encodes a PKCS #12 file of a private key (PKCS #8 PrivateKeyInfo DER;
+// empty for none) and certificates (DER concatenated, the key's first) as
+// openssl 3 writes one by default: the key in a shrouded key bag and the
+// certificates in an encrypted SafeContents, both under PBES2 (PBKDF2 over
+// HMAC-SHA-256, AES-256-CBC), the whole under an HMAC-SHA-256 MAC keyed by
+// the PKCS #12 KDF; the key and the first certificate share a localKeyID
+// (the certificate's SHA-1). The password is UTF-8. OK, or ERR_MALFORMED
+// for certificates that are not DER or a password with a character past
+// U+FFFF (which the KDF cannot take).
+fn pkcs12_encode(key: const u8[:], certs: const u8[:], password: const u8[:], iterations: i64 = 2048) -> u8[>..], i64 {
+    var out: u8[>..] = [];
+    let none: u8[0] = [];
+    let bmp, okb = bmp_password(password);
+    if !okb || iterations < 1 { return out, ERR_MALFORMED; }
+    var id: u8[>..] = [];
+    var cert_bags: u8[>..] = [];
+    var at = 0;
+    while at < certs.len {
+        let t, ok = asn1::read(certs, at, certs.len);
+        if !ok || t.tag != asn1::SEQUENCE { return out, ERR_MALFORMED; }
+        let der = certs[t.start..t.end];
+        if id.len == 0 && key.len > 0 { id.append(bignum::hash_bits(160, der)); }
+        var octets: u8[>..] = [];
+        asn1::put_octets(octets, der);
+        var cb: u8[>..] = [];
+        asn1::put_oid(cb, OID_X509_CERT);
+        asn1::put(cb, asn1::ctx(0, true), octets);
+        var cbs: u8[>..] = [];
+        asn1::put(cbs, asn1::SEQUENCE, cb);
+        put_bag(cert_bags, OID_CERT_BAG, cbs, if at == 0 { id[..] } else { none[..] });
+        at = t.end;
+    }
+    var infos: u8[>..] = [];
+    if cert_bags.len > 0 {
+        var sc: u8[>..] = [];
+        asn1::put(sc, asn1::SEQUENCE, cert_bags);
+        var alg: u8[>..] = [];
+        let ct = pbes2_encrypt(sc, password, iterations, alg);
+        var eci: u8[>..] = [];
+        asn1::put_oid(eci, OID_PKCS7_DATA);
+        eci.append(alg);
+        asn1::put(eci, asn1::ctx(0, false), ct);
+        var ed: u8[>..] = [];
+        asn1::put_i64(ed, 0);
+        asn1::put(ed, asn1::SEQUENCE, eci);
+        var eds: u8[>..] = [];
+        asn1::put(eds, asn1::SEQUENCE, ed);
+        var info: u8[>..] = [];
+        asn1::put_oid(info, OID_PKCS7_ENCRYPTED);
+        asn1::put(info, asn1::ctx(0, true), eds);
+        asn1::put(infos, asn1::SEQUENCE, info);
+    }
+    if key.len > 0 {
+        var alg: u8[>..] = [];
+        let ct = pbes2_encrypt(key, password, iterations, alg);
+        var epki: u8[>..] = [];
+        epki.append(alg);
+        asn1::put_octets(epki, ct);
+        var epkis: u8[>..] = [];
+        asn1::put(epkis, asn1::SEQUENCE, epki);
+        var bag: u8[>..] = [];
+        put_bag(bag, OID_SHROUDED_KEY_BAG, epkis, id);
+        var sc: u8[>..] = [];
+        asn1::put(sc, asn1::SEQUENCE, bag);
+        var octets: u8[>..] = [];
+        asn1::put_octets(octets, sc);
+        var info: u8[>..] = [];
+        asn1::put_oid(info, OID_PKCS7_DATA);
+        asn1::put(info, asn1::ctx(0, true), octets);
+        asn1::put(infos, asn1::SEQUENCE, info);
+    }
+    var auth_safe: u8[>..] = [];
+    asn1::put(auth_safe, asn1::SEQUENCE, infos);
+    var as_octets: u8[>..] = [];
+    asn1::put_octets(as_octets, auth_safe);
+    var ci: u8[>..] = [];
+    asn1::put_oid(ci, OID_PKCS7_DATA);
+    asn1::put(ci, asn1::ctx(0, true), as_octets);
+    // MacData: SEQUENCE { DigestInfo { sha256, mac }, macSalt, iterations }.
+    var salt: u8[16] = [0; 16];
+    entropy::random_bytes(salt);
+    let mk = pkcs12_kdf(256, 3, bmp, salt, iterations, 32);
+    let mac = bignum::hmac(256, mk, auth_safe);
+    var dalg: u8[>..] = [];
+    asn1::put_oid(dalg, "2.16.840.1.101.3.4.2.1");
+    asn1::put_null(dalg);
+    var di: u8[>..] = [];
+    asn1::put(di, asn1::SEQUENCE, dalg);
+    asn1::put_octets(di, mac);
+    var md: u8[>..] = [];
+    asn1::put(md, asn1::SEQUENCE, di);
+    asn1::put_octets(md, salt);
+    asn1::put_i64(md, iterations);
+    var pfx: u8[>..] = [];
+    asn1::put_i64(pfx, 3);
+    asn1::put(pfx, asn1::SEQUENCE, ci);
+    asn1::put(pfx, asn1::SEQUENCE, md);
+    asn1::put(out, asn1::SEQUENCE, pfx);
+    return out, OK;
 }

@@ -2,6 +2,8 @@
 // export a key with its certificates: decode it with its password, parse
 // the private key and the certificates, and check that the key belongs to
 // the leaf certificate by signing with it. A wrong password is refused.
+// Then the key and certificates are written as a new file under another
+// password (pkcs12_encode, as openssl 3 writes one) and read back.
 // Without arguments it reads example.p12 (made by openssl 4 with its
 // defaults, PBES2 with AES-256 and a SHA-256 MAC; password "goose").
 //
@@ -9,8 +11,9 @@
 import std;
 import os;
 import x509 from "..";
-import bignum from "SorinS/bigmongoose@v0.7.0";
-import asn1 from "SorinS/asn1goose@v0.7.0";
+import entropy from "SorinS/entropygoose@v0.9.1";
+import bignum from "SorinS/bigmongoose@v0.9.1";
+import asn1 from "SorinS/asn1goose@v0.9.1";
 import x509.keys;
 import x509.pkcs12;
 
@@ -67,6 +70,12 @@ fn main() {
     let k2, c2, e2 = x509::pkcs12_decode(pfx, wrong);
     guard e2 != x509::OK else { print("pkcs12: a wrong password was taken"); exit(1); }
     print("wrong password: ", x509::error_text(e2));
+
+    // Written again under a new password, and read back.
+    let again, ee = x509::pkcs12_encode(key_der, certs, "a new password");
+    let k3, c3, e3 = x509::pkcs12_decode(again, "a new password");
+    guard ee == x509::OK && e3 == x509::OK && k3 == key_der && c3 == certs else { print("pkcs12: the new file does not read back"); exit(1); }
+    print("written again: ", again.len, " bytes, read back with the new password");
 
     // To keep the key on its own, as a server wants it: PKCS #8 PEM.
     var pem: u8[>..] = [];

@@ -10,8 +10,8 @@
 namespace x509;
 
 import std;
-import bignum from "SorinS/bigmongoose@v0.7.0";
-import asn1 from "SorinS/asn1goose@v0.7.0";
+import bignum from "SorinS/bigmongoose@v0.9.1";
+import asn1 from "SorinS/asn1goose@v0.9.1";
 import bignum.rsa;
 import bignum.ec;
 import bignum.ed25519;
@@ -117,6 +117,7 @@ let KEY_EC_BP384: i64 = 44;
 let KEY_EC_BP512: i64 = 45;
 let KEY_ED448: i64 = 46;             // id-Ed448 (RFC 8410): signatures
 let KEY_X448: i64 = 47;              // id-X448 (RFC 8410): key agreement only (CMS, cms_env)
+let KEY_EC_SECP256K1: i64 = 48;      // secp256k1 (SEC 2), ECDSA and ECDH
 
 // Key usage bits (RFC 5280 §4.2.1.3), as KU_* masks of Cert.key_usage.
 let KU_DIGITAL_SIGNATURE: u32 = 1;
@@ -275,6 +276,7 @@ fn ec_named_curve(der: const u8[:], o: asn1::Tlv) -> i64 {
     if asn1::oid_is(der, o, "1.3.36.3.3.2.8.1.1.7") { return KEY_EC_BP256; }
     if asn1::oid_is(der, o, "1.3.36.3.3.2.8.1.1.11") { return KEY_EC_BP384; }
     if asn1::oid_is(der, o, "1.3.36.3.3.2.8.1.1.13") { return KEY_EC_BP512; }
+    if asn1::oid_is(der, o, "1.3.132.0.10") { return KEY_EC_SECP256K1; }
     return KEY_UNKNOWN;
 }
 
@@ -326,7 +328,8 @@ fn mlkem_oid(k: i64) -> const u8[:] {
 }
 
 fn is_ec(kind: i64) -> bool {
-    kind == KEY_EC_P256 || kind == KEY_EC_P384 || kind == KEY_EC_P521 || kind == KEY_EC_P224 || is_brainpool(kind)
+    kind == KEY_EC_P256 || kind == KEY_EC_P384 || kind == KEY_EC_P521 || kind == KEY_EC_P224 || is_brainpool(kind) ||
+    kind == KEY_EC_SECP256K1
 }
 
 fn is_brainpool(kind: i64) -> bool { kind == KEY_EC_BP256 || kind == KEY_EC_BP384 || kind == KEY_EC_BP512 }
@@ -340,6 +343,7 @@ fn curve_of_key(kind: i64) -> bignum::Curve {
     if kind == KEY_EC_BP256 { return bignum::bp256(); }
     if kind == KEY_EC_BP384 { return bignum::bp384(); }
     if kind == KEY_EC_BP512 { return bignum::bp512(); }
+    if kind == KEY_EC_SECP256K1 { return bignum::secp256k1(); }
     return bignum::p521();
 }
 

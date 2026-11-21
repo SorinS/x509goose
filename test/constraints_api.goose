@@ -1,8 +1,9 @@
 // The name forms' subtree matching in x509.constraints, at its edges.
 import std;
 import x509 from "..";
-import bignum from "SorinS/bigmongoose@v0.7.0";
-import asn1 from "SorinS/asn1goose@v0.7.0";
+import entropy from "SorinS/entropygoose@v0.9.1";
+import bignum from "SorinS/bigmongoose@v0.9.1";
+import asn1 from "SorinS/asn1goose@v0.9.1";
 import x509.constraints;
 
 var failures = 0;

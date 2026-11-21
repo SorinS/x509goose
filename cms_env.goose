@@ -69,7 +69,7 @@ import bignum.modes;
 import bignum.gcm;
 import bignum.keywrap;
 import bignum.hmac;
-import bignum.entropy;
+import entropy;
 
 let OID_CMS_ENVELOPED_DATA:      const u8[:] = "1.2.840.113549.1.7.3";
 let OID_CMS_AUTH_ENVELOPED_DATA: const u8[:] = "1.2.840.113549.1.9.16.1.23";
@@ -466,7 +466,7 @@ fn cms_encrypt(content_type: const u8[:], content: const u8[:], recipients: cons
     }
     var cek: u8[>..] = [];
     cek.resize(cms_cipher_key_len(c), 0);
-    bignum::random_bytes(cek);
+    entropy::random_bytes(cek);
     var ris:     u8[>..] = [];
     var version: i64     = 0;
     var n = 0;
@@ -496,7 +496,7 @@ fn cms_encrypt(content_type: const u8[:], content: const u8[:], recipients: cons
     if gcm {
         // GCMParameters: the nonce and the tag length, 16 (as openssl writes).
         var nonce: u8[12] = [0; 12];
-        bignum::random_bytes(nonce);
+        entropy::random_bytes(nonce);
         var gp: u8[>..] = [];
         asn1::put_octets(gp, nonce);
         asn1::put_i64(gp, 16);
@@ -506,14 +506,14 @@ fn cms_encrypt(content_type: const u8[:], content: const u8[:], recipients: cons
         tag.append(sealed[sealed.len - 16..]);
     } else if c == CMS_DES3_CBC {
         var iv: u8[8] = [0; 8];
-        bignum::random_bytes(iv);
+        entropy::random_bytes(iv);
         asn1::put_octets(alg, iv);
         ct = bignum::pkcs7_pad(content, 8);
         let k = bignum::des3_init(cek);
         bignum::cbc_encrypt(k, iv, ct);
     } else {
         var iv: u8[16] = [0; 16];
-        bignum::random_bytes(iv);
+        entropy::random_bytes(iv);
         asn1::put_octets(alg, iv);
         ct = bignum::pkcs7_pad(content, 16);
         let k = bignum::aes_init(cek);
@@ -595,7 +595,7 @@ fn cms_recover_cek(d: const u8[:], ris: asn1::Tlv, key: const PrivateKey&, cert:
                 // A random key unless the block holds one of kl bytes.
                 var cek: u8[>..] = [];
                 cek.resize(kl, 0);
-                bignum::random_bytes(cek);
+                entropy::random_bytes(cek);
                 if !bignum::rsa_decrypt_pkcs1_session_key(key.rsa, ek, cek) { return none, ERR_CMS_DECRYPT; }
                 return cek, OK;
             }
